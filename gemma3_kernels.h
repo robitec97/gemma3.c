@@ -172,8 +172,8 @@ void gemma3_attention_single(float *output, const float *q,
  * Grouped Query Attention
  * Handles multiple query heads sharing KV heads
  * q: [n_heads, head_dim]
- * k_cache: [n_kv_heads, seq_len, head_dim]
- * v_cache: [n_kv_heads, seq_len, head_dim]
+ * k_cache: [seq_len, n_kv_heads, head_dim] - interleaved by position
+ * v_cache: [seq_len, n_kv_heads, head_dim] - interleaved by position
  * output: [n_heads, head_dim]
  * n_heads must be divisible by n_kv_heads
  */

@@ -147,8 +147,9 @@ void gemma3_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
     float rsqrt_ss = 1.0f / sqrtf(ss);
 
     // Normalize and scale (weight is BF16)
+    // Gemma uses (1.0 + weight) formula
     for (int i = 0; i < n; i++) {
-        y[i] = x[i] * rsqrt_ss * bf16_to_f32(weight[i]);
+        y[i] = x[i] * rsqrt_ss * (1.0f + bf16_to_f32(weight[i]));
     }
 }
 
@@ -162,8 +163,9 @@ void gemma3_rmsnorm_bf16_inplace(float *x, const uint16_t *weight, int n, float 
     float rsqrt_ss = 1.0f / sqrtf(ss);
 
     // Normalize and scale in-place (weight is BF16)
+    // Gemma uses (1.0 + weight) formula
     for (int i = 0; i < n; i++) {
-        x[i] = x[i] * rsqrt_ss * bf16_to_f32(weight[i]);
+        x[i] = x[i] * rsqrt_ss * (1.0f + bf16_to_f32(weight[i]));
     }
 }
 
@@ -378,21 +380,57 @@ void gemma3_gqa(float *output, const float *q,
                 float scale, const float *mask) {
     // Grouped Query Attention
     // n_heads query heads share n_kv_heads KV heads
+    //
+    // IMPORTANT: k_cache and v_cache have layout [seq_len, n_kv_heads, head_dim]
+    // (interleaved by sequence position, not by head)
+
     int heads_per_group = n_heads / n_kv_heads;
+    int kv_stride = n_kv_heads * head_dim;  // Stride between sequence positions
+
+    // Allocate temporary storage for attention scores
+    float *scores = (float *)malloc(seq_len * sizeof(float));
+    if (!scores) return;
 
     for (int h = 0; h < n_heads; h++) {
         // Determine which KV head this query head uses
         int kv_head = h / heads_per_group;
 
-        // Compute attention for this head
-        gemma3_attention_single(
-            output + h * head_dim,
-            q + h * head_dim,
-            k_cache + kv_head * seq_len * head_dim,
-            v_cache + kv_head * seq_len * head_dim,
-            seq_len, head_dim, scale, mask
-        );
+        const float *q_head = q + h * head_dim;
+        float *out_head = output + h * head_dim;
+
+        // Compute attention scores: scores[i] = q . k[i] * scale
+        // k_cache layout: [seq_pos][kv_head][head_dim]
+        // So k at position i, kv_head h is at: k_cache[i * kv_stride + kv_head * head_dim]
+        for (int i = 0; i < seq_len; i++) {
+            const float *k_pos = k_cache + i * kv_stride + kv_head * head_dim;
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                score += q_head[d] * k_pos[d];
+            }
+            scores[i] = score * scale;
+
+            // Apply mask if provided
+            if (mask) {
+                scores[i] += mask[i];
+            }
+        }
+
+        // Softmax
+        gemma3_softmax_inplace(scores, seq_len);
+
+        // Compute weighted sum of values
+        // v_cache layout: [seq_pos][kv_head][head_dim]
+        gemma3_vec_zero(out_head, head_dim);
+        for (int i = 0; i < seq_len; i++) {
+            const float *v_pos = v_cache + i * kv_stride + kv_head * head_dim;
+            float w = scores[i];
+            for (int d = 0; d < head_dim; d++) {
+                out_head[d] += w * v_pos[d];
+            }
+        }
     }
+
+    free(scores);
 }
 
 void gemma3_sliding_window_mask(float *mask, int query_pos, int window_size) {

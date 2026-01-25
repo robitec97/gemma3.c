@@ -11,6 +11,7 @@
 
 #include "gemma3.h"
 #include "gemma3_kernels.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -315,7 +316,9 @@ static void layer_mlp(
     const uint16_t *down_weight, /* [hidden_size, intermediate_size] BF16 */
     float *gate_buf,          /* [intermediate_size] */
     float *up_buf,            /* [intermediate_size] */
-    const gemma3_config *cfg
+    const gemma3_config *cfg,
+    int layer_idx,
+    int pos
 ) {
     int hidden_size = cfg->hidden_size;
     int intermediate_size = cfg->intermediate_size;
@@ -331,6 +334,9 @@ static void layer_mlp(
 
     /* Down projection (BF16 weights) */
     gemma3_matvec_bf16(output, down_weight, gate_buf, hidden_size, intermediate_size);
+
+    (void)layer_idx;
+    (void)pos;
 }
 
 /* ============================================================================
@@ -393,7 +399,7 @@ int gemma3_transformer_forward(
             cfg, l, pos
         );
 
-        /* Post-attention RMSNorm (Gemma 3 specific, BF16 weights) */
+        /* Post-attention RMSNorm (Gemma 2/3 specific, BF16 weights with 1+weight) */
         if (layer_weights_post_attn_ln) {
             gemma3_rmsnorm_bf16_inplace(buf->proj_out, layer_weights_post_attn_ln,
                                         hidden_size, cfg->rmsnorm_eps);
@@ -418,10 +424,10 @@ int gemma3_transformer_forward(
             buf->x_norm,
             layer_weights_gate, layer_weights_up, layer_weights_down,
             buf->mlp_gate, buf->mlp_up,
-            cfg
+            cfg, l, pos
         );
 
-        /* Post-feedforward RMSNorm (Gemma 3 specific, BF16 weights) */
+        /* Post-feedforward RMSNorm (Gemma 2/3 specific, BF16 weights with 1+weight) */
         if (layer_weights_post_ff_ln) {
             gemma3_rmsnorm_bf16_inplace(buf->mlp_out, layer_weights_post_ff_ln,
                                         hidden_size, cfg->rmsnorm_eps);

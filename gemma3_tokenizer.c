@@ -362,6 +362,13 @@ int gemma3_tokenize(gemma3_tokenizer *tok, const char *text,
     bpe_symbol *symbols = (bpe_symbol *)malloc(max_symbols * sizeof(bpe_symbol));
     if (!symbols) return GEMMA3_ERR_OUT_OF_MEMORY;
 
+    /* Initialize all symbol IDs to -1 (invalid) */
+    for (int i = 0; i < max_symbols; i++) {
+        symbols[i].id = -1;
+        symbols[i].prev = -1;
+        symbols[i].next = -1;
+    }
+
     /* Initialize: each UTF-8 character becomes a symbol */
     int n_symbols = 0;
     int pos = 0;
