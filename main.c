@@ -29,6 +29,11 @@ typedef struct {
     int seed;
     int context_size;
     int verbose;
+    int greedy;
+    int verbose_tokens;
+    int tokenize_mode;      /* --tokenize: print token IDs for prompt */
+    int detokenize_mode;    /* --detokenize: decode token IDs */
+    int logits_mode;        /* --logits: show top logits for single forward */
 } cli_config;
 
 static cli_config default_cli_config(void) {
@@ -44,6 +49,11 @@ static cli_config default_cli_config(void) {
         .seed = -1,
         .context_size = 8192,
         .verbose = 0,
+        .greedy = 0,
+        .verbose_tokens = 0,
+        .tokenize_mode = 0,
+        .detokenize_mode = 0,
+        .logits_mode = 0,
     };
 }
 
@@ -63,11 +73,24 @@ static void signal_handler(int sig) {
  * ========================================================================== */
 
 static int stream_callback(int token_id, const char *token_str, void *user_data) {
-    (void)token_id;
     (void)user_data;
 
     if (g_interrupted) {
         return 1;  /* Stop generation */
+    }
+
+    /* Skip control tokens by ID: PAD(0), EOS(1), BOS(2), UNK(3) */
+    if (token_id <= 3) {
+        return 0;
+    }
+
+    /* Skip control tokens by string pattern */
+    if (token_str && token_str[0] != '\0') {
+        /* Skip any <...> control tokens like <end_of_turn>, <start_of_turn>, <bos>, etc. */
+        size_t len = strlen(token_str);
+        if (len >= 3 && token_str[0] == '<' && token_str[len-1] == '>') {
+            return 0;
+        }
     }
 
     /* Handle special tokens */
@@ -114,14 +137,23 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -k, --top-k <n>         Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <f>             Top-p sampling (default: 0.9)\n");
     fprintf(stderr, "  --seed <n>              Random seed (-1 for random)\n");
+    fprintf(stderr, "  --greedy                Force greedy decoding (deterministic)\n");
+    fprintf(stderr, "  --verbose-tokens        Print token IDs during generation (to stderr)\n");
     fprintf(stderr, "  -c, --context <n>       Context size (default: 8192)\n");
     fprintf(stderr, "  -v, --verbose           Verbose output\n");
     fprintf(stderr, "  -h, --help              Show this help message\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Debug modes:\n");
+    fprintf(stderr, "  --tokenize              Tokenize prompt and print token IDs\n");
+    fprintf(stderr, "  --detokenize            Detokenize comma-separated IDs from prompt\n");
+    fprintf(stderr, "  --logits                Run single forward pass and show top-20 logits\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Hello, how are you?\"\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -i\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -i -s \"You are a pirate.\"\n", prog);
+    fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Say OK\" --greedy --verbose-tokens\n", prog);
+    fprintf(stderr, "  %s -m ./gemma-3-4b-it --tokenize -p \"Hello, world!\"\n", prog);
 }
 
 /* ============================================================================
@@ -192,6 +224,16 @@ static int parse_args(int argc, char **argv, cli_config *config) {
             config->context_size = atoi(argv[i]);
         } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
             config->verbose = 1;
+        } else if (strcmp(arg, "--greedy") == 0) {
+            config->greedy = 1;
+        } else if (strcmp(arg, "--verbose-tokens") == 0) {
+            config->verbose_tokens = 1;
+        } else if (strcmp(arg, "--tokenize") == 0) {
+            config->tokenize_mode = 1;
+        } else if (strcmp(arg, "--detokenize") == 0) {
+            config->detokenize_mode = 1;
+        } else if (strcmp(arg, "--logits") == 0) {
+            config->logits_mode = 1;
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -206,12 +248,239 @@ static int parse_args(int argc, char **argv, cli_config *config) {
         return 0;
     }
 
+    /* Special modes only require prompt */
+    if (config->tokenize_mode || config->detokenize_mode || config->logits_mode) {
+        if (!config->prompt) {
+            fprintf(stderr, "Error: -p (prompt) is required for debug modes\n");
+            return 0;
+        }
+        return 1;
+    }
+
     if (!config->interactive && !config->prompt) {
         fprintf(stderr, "Error: Either -p (prompt) or -i (interactive) is required\n");
         return 0;
     }
 
     return 1;
+}
+
+/* ============================================================================
+ * Tokenize Mode
+ * ========================================================================== */
+
+static int run_tokenize_mode(gemma3_ctx *ctx, const cli_config *config) {
+    gemma3_tokenizer *tok = gemma3_get_tokenizer(ctx);
+    if (!tok) {
+        fprintf(stderr, "Error: Failed to get tokenizer\n");
+        return 1;
+    }
+
+    /* Allocate token buffer */
+    int max_tokens = config->context_size;
+    int *tokens = (int *)malloc(max_tokens * sizeof(int));
+    if (!tokens) {
+        fprintf(stderr, "Error: Out of memory\n");
+        return 1;
+    }
+
+    /* Tokenize (with BOS, no EOS) */
+    int n_tokens = gemma3_tokenize(tok, config->prompt, tokens, max_tokens, 1, 0);
+    if (n_tokens < 0) {
+        fprintf(stderr, "Error: Tokenization failed (code %d)\n", n_tokens);
+        free(tokens);
+        return 1;
+    }
+
+    /* Print token IDs */
+    printf("Input: \"%s\"\n", config->prompt);
+    printf("Token count: %d\n", n_tokens);
+    printf("Token IDs: [");
+    for (int i = 0; i < n_tokens; i++) {
+        if (i > 0) printf(", ");
+        printf("%d", tokens[i]);
+    }
+    printf("]\n");
+
+    /* Print each token with its string representation */
+    printf("\nToken breakdown:\n");
+    for (int i = 0; i < n_tokens; i++) {
+        const char *piece = gemma3_decode_token(tok, tokens[i]);
+        printf("  %4d: %6d -> '%s'\n", i, tokens[i], piece ? piece : "(null)");
+    }
+
+    free(tokens);
+    return 0;
+}
+
+/* ============================================================================
+ * Detokenize Mode
+ * ========================================================================== */
+
+static int run_detokenize_mode(gemma3_ctx *ctx, const cli_config *config) {
+    gemma3_tokenizer *tok = gemma3_get_tokenizer(ctx);
+    if (!tok) {
+        fprintf(stderr, "Error: Failed to get tokenizer\n");
+        return 1;
+    }
+
+    /* Parse comma-separated token IDs from prompt */
+    int max_tokens = 4096;
+    int *tokens = (int *)malloc(max_tokens * sizeof(int));
+    if (!tokens) {
+        fprintf(stderr, "Error: Out of memory\n");
+        return 1;
+    }
+
+    int n_tokens = 0;
+    const char *p = config->prompt;
+    while (*p && n_tokens < max_tokens) {
+        /* Skip whitespace and commas */
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n') p++;
+        if (!*p) break;
+
+        /* Parse number */
+        char *end;
+        long val = strtol(p, &end, 10);
+        if (end == p) {
+            fprintf(stderr, "Error: Invalid token ID at position %ld\n", (long)(p - config->prompt));
+            free(tokens);
+            return 1;
+        }
+        tokens[n_tokens++] = (int)val;
+        p = end;
+    }
+
+    if (n_tokens == 0) {
+        fprintf(stderr, "Error: No token IDs provided\n");
+        free(tokens);
+        return 1;
+    }
+
+    /* Print token IDs */
+    printf("Token IDs: [");
+    for (int i = 0; i < n_tokens; i++) {
+        if (i > 0) printf(", ");
+        printf("%d", tokens[i]);
+    }
+    printf("]\n");
+
+    /* Detokenize */
+    char *text = gemma3_detokenize(tok, tokens, n_tokens);
+    if (!text) {
+        fprintf(stderr, "Error: Detokenization failed\n");
+        free(tokens);
+        return 1;
+    }
+
+    printf("Decoded text: \"%s\"\n", text);
+    free(text);
+    free(tokens);
+    return 0;
+}
+
+/* ============================================================================
+ * Logits Mode - Single forward pass for debugging
+ * ========================================================================== */
+
+static int run_logits_mode(gemma3_ctx *ctx, const cli_config *config) {
+    gemma3_tokenizer *tok = gemma3_get_tokenizer(ctx);
+    if (!tok) {
+        fprintf(stderr, "Error: Failed to get tokenizer\n");
+        return 1;
+    }
+
+    const gemma3_config *model_config = gemma3_get_config(ctx);
+    int vocab_size = model_config->vocab_size;
+
+    /* Allocate token buffer */
+    int max_tokens = config->context_size;
+    int *tokens = (int *)malloc(max_tokens * sizeof(int));
+    float *logits = (float *)malloc(vocab_size * sizeof(float));
+    if (!tokens || !logits) {
+        fprintf(stderr, "Error: Out of memory\n");
+        free(tokens);
+        free(logits);
+        return 1;
+    }
+
+    /* Tokenize (with BOS, no EOS) */
+    int n_tokens = gemma3_tokenize(tok, config->prompt, tokens, max_tokens, 1, 0);
+    if (n_tokens < 0) {
+        fprintf(stderr, "Error: Tokenization failed (code %d)\n", n_tokens);
+        free(tokens);
+        free(logits);
+        return 1;
+    }
+
+    printf("Input: \"%s\"\n", config->prompt);
+    printf("Token count: %d\n", n_tokens);
+    printf("Token IDs: [");
+    for (int i = 0; i < n_tokens; i++) {
+        if (i > 0) printf(", ");
+        printf("%d", tokens[i]);
+    }
+    printf("]\n\n");
+
+    /* Reset KV cache and run forward pass */
+    gemma3_reset_cache(ctx);
+    int err = gemma3_forward_batch(ctx, tokens, n_tokens, 0, logits);
+    if (err != 0) {
+        fprintf(stderr, "Error: Forward pass failed (code %d)\n", err);
+        free(tokens);
+        free(logits);
+        return 1;
+    }
+
+    /* Find top-20 tokens by logit value */
+    typedef struct { int id; float logit; } token_logit;
+    token_logit top20[20];
+    for (int i = 0; i < 20; i++) {
+        top20[i].id = -1;
+        top20[i].logit = -1e30f;
+    }
+
+    for (int i = 0; i < vocab_size; i++) {
+        /* Find minimum in top20 */
+        int min_idx = 0;
+        for (int j = 1; j < 20; j++) {
+            if (top20[j].logit < top20[min_idx].logit) {
+                min_idx = j;
+            }
+        }
+        /* Replace if current logit is higher */
+        if (logits[i] > top20[min_idx].logit) {
+            top20[min_idx].id = i;
+            top20[min_idx].logit = logits[i];
+        }
+    }
+
+    /* Sort top20 by logit descending */
+    for (int i = 0; i < 19; i++) {
+        for (int j = i + 1; j < 20; j++) {
+            if (top20[j].logit > top20[i].logit) {
+                token_logit tmp = top20[i];
+                top20[i] = top20[j];
+                top20[j] = tmp;
+            }
+        }
+    }
+
+    /* Print top-20 */
+    printf("Top-20 next token predictions:\n");
+    printf("%-6s  %-10s  %-10s  %s\n", "Rank", "Token ID", "Logit", "Token");
+    printf("------  ----------  ----------  --------\n");
+    for (int i = 0; i < 20; i++) {
+        if (top20[i].id >= 0) {
+            const char *piece = gemma3_decode_token(tok, top20[i].id);
+            printf("%-6d  %-10d  %10.4f  '%s'\n",
+                   i + 1, top20[i].id, top20[i].logit, piece ? piece : "(null)");
+        }
+    }
+
+    free(tokens);
+    free(logits);
+    return 0;
 }
 
 /* ============================================================================
@@ -226,12 +495,30 @@ static int run_single_prompt(gemma3_ctx *ctx, const cli_config *config) {
         .top_p = config->top_p,
         .seed = config->seed,
         .stop_on_eos = 1,
+        .greedy = config->greedy,
+        .verbose_tokens = config->verbose_tokens,
     };
 
     g_interrupted = 0;
 
-    char *response = gemma3_generate(ctx, config->prompt, &params,
-                                     stream_callback, NULL);
+    /* Use chat interface to properly format prompt with chat template */
+    gemma3_message messages[2];
+    int num_messages = 0;
+
+    /* Add system message if provided */
+    if (config->system_prompt && strlen(config->system_prompt) > 0) {
+        messages[num_messages].role = GEMMA3_ROLE_SYSTEM;
+        messages[num_messages].content = config->system_prompt;
+        num_messages++;
+    }
+
+    /* Add user message */
+    messages[num_messages].role = GEMMA3_ROLE_USER;
+    messages[num_messages].content = config->prompt;
+    num_messages++;
+
+    char *response = gemma3_chat(ctx, messages, num_messages, &params,
+                                 stream_callback, NULL);
     printf("\n");
 
     if (!response) {
@@ -337,6 +624,8 @@ static int run_interactive(gemma3_ctx *ctx, const cli_config *config) {
             .top_p = config->top_p,
             .seed = config->seed,
             .stop_on_eos = 1,
+            .greedy = config->greedy,
+            .verbose_tokens = config->verbose_tokens,
         };
 
         g_interrupted = 0;
@@ -406,7 +695,13 @@ int main(int argc, char **argv) {
     }
 
     int result;
-    if (config.interactive) {
+    if (config.tokenize_mode) {
+        result = run_tokenize_mode(ctx, &config);
+    } else if (config.detokenize_mode) {
+        result = run_detokenize_mode(ctx, &config);
+    } else if (config.logits_mode) {
+        result = run_logits_mode(ctx, &config);
+    } else if (config.interactive) {
         result = run_interactive(ctx, &config);
     } else {
         result = run_single_prompt(ctx, &config);

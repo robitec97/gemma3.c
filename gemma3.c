@@ -116,6 +116,8 @@ gemma3_gen_params gemma3_default_params(void) {
         .top_p = 0.9f,
         .seed = -1,
         .stop_on_eos = 1,
+        .greedy = 0,
+        .verbose_tokens = 0,
     };
 }
 
@@ -271,8 +273,8 @@ static int sample_token(gemma3_ctx *ctx, float *logits, const gemma3_gen_params 
     /* Copy logits to working buffer */
     memcpy(ctx->probs_buf, logits, vocab_size * sizeof(float));
 
-    if (params->temperature == 0.0f) {
-        /* Greedy sampling */
+    /* Greedy sampling: explicit flag or temperature == 0 */
+    if (params->greedy || params->temperature == 0.0f) {
         return gemma3_argmax(ctx->probs_buf, vocab_size);
     }
 
@@ -340,14 +342,21 @@ char *gemma3_generate_tokens(gemma3_ctx *ctx, const int *tokens, int num_tokens,
     int n_gen = 0;
 
     int eos_id = gemma3_eos_token(ctx->tokenizer);
+    int end_turn_id = gemma3_end_turn_token(ctx->tokenizer);
 
     /* Generation loop */
     while (n_gen < max_gen) {
         /* Sample next token */
         int next_token = sample_token(ctx, ctx->logits_buf, &p);
 
-        /* Check for EOS */
-        if (p.stop_on_eos && next_token == eos_id) {
+        /* Verbose token debug output */
+        if (p.verbose_tokens) {
+            const char *tok_str = gemma3_decode_token(ctx->tokenizer, next_token);
+            fprintf(stderr, "[DEBUG] pos=%d token=%d '%s'\n", pos, next_token, tok_str ? tok_str : "");
+        }
+
+        /* Check for EOS or end-of-turn (Gemma 3 IT uses <end_of_turn>) */
+        if (p.stop_on_eos && (next_token == eos_id || next_token == end_turn_id)) {
             break;
         }
 

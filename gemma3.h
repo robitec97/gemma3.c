@@ -105,6 +105,8 @@ typedef struct {
     float top_p;            /* Top-p (nucleus) sampling (1.0 = disabled) */
     int seed;               /* Random seed (-1 for random) */
     int stop_on_eos;        /* Stop when EOS token generated */
+    int greedy;             /* Force greedy decoding (overrides temperature) */
+    int verbose_tokens;     /* Print token IDs during generation */
 } gemma3_gen_params;
 
 /**
@@ -209,6 +211,8 @@ const char *gemma3_decode_token(gemma3_tokenizer *tok, int token_id);
 int gemma3_bos_token(gemma3_tokenizer *tok);
 int gemma3_eos_token(gemma3_tokenizer *tok);
 int gemma3_pad_token(gemma3_tokenizer *tok);
+int gemma3_end_turn_token(gemma3_tokenizer *tok);
+int gemma3_start_turn_token(gemma3_tokenizer *tok);
 
 /* ============================================================================
  * Text Generation

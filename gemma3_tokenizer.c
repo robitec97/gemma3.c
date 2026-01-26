@@ -610,6 +610,14 @@ int gemma3_pad_token(gemma3_tokenizer *tok) {
     return tok ? tok->pad_id : GEMMA3_TOKEN_PAD;
 }
 
+int gemma3_end_turn_token(gemma3_tokenizer *tok) {
+    return tok ? tok->end_turn_id : GEMMA3_TOKEN_END_TURN;
+}
+
+int gemma3_start_turn_token(gemma3_tokenizer *tok) {
+    return tok ? tok->start_turn_id : GEMMA3_TOKEN_START_TURN;
+}
+
 /* ============================================================================
  * Chat Template Formatting
  * ========================================================================== */
