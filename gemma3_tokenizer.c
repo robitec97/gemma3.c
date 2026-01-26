@@ -25,8 +25,8 @@
 #define GEMMA3_TOKEN_UNK 3
 
 /* Chat template tokens */
-#define GEMMA3_TOKEN_START_TURN 106  /* <start_of_turn> */
-#define GEMMA3_TOKEN_END_TURN 107    /* <end_of_turn> */
+#define GEMMA3_TOKEN_START_TURN 105  /* <start_of_turn> */
+#define GEMMA3_TOKEN_END_TURN 106    /* <end_of_turn> */
 
 /* ============================================================================
  * Data Structures
