@@ -19,6 +19,11 @@ static uint64_t g_rng_state = 12345678901234567ULL;
  * ========================================================================== */
 
 void gemma3_matmul(float *C, const float *A, const float *B, int M, int K, int N) {
+#ifdef USE_BLAS
+    // C = A * B: A is [M,K], B is [K,N], C is [M,N], all row-major
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
+#else
     // C[i,j] = sum_k A[i,k] * B[k,j]
     // A: [M, K], B: [K, N], C: [M, N]
     for (int i = 0; i < M; i++) {
@@ -30,9 +35,14 @@ void gemma3_matmul(float *C, const float *A, const float *B, int M, int K, int N
             C[i * N + j] = sum;
         }
     }
+#endif
 }
 
 void gemma3_matvec(float *y, const float *A, const float *x, int M, int K) {
+#ifdef USE_BLAS
+    // y = A * x: A is [M, K] row-major, x is [K], y is [M]
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, M, K, 1.0f, A, K, x, 1, 0.0f, y, 1);
+#else
     // y[i] = sum_k A[i,k] * x[k]
     for (int i = 0; i < M; i++) {
         float sum = 0.0f;
@@ -42,6 +52,7 @@ void gemma3_matvec(float *y, const float *A, const float *x, int M, int K) {
         }
         y[i] = sum;
     }
+#endif
 }
 
 void gemma3_matvec_batched(float *y, const float *A, const float *x,
@@ -125,6 +136,31 @@ static inline float bf16_to_f32(uint16_t bf16) {
 }
 
 void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K) {
+#ifdef USE_BLAS
+    // Allocate a single row buffer for BF16->F32 conversion
+    float *row_f32 = (float *)malloc(K * sizeof(float));
+    if (row_f32) {
+        for (int i = 0; i < M; i++) {
+            const uint16_t *row = A + i * K;
+            // Convert BF16 row to F32 (stays hot in L1 cache)
+            for (int k = 0; k < K; k++) {
+                row_f32[k] = bf16_to_f32(row[k]);
+            }
+            y[i] = cblas_sdot(K, row_f32, 1, x, 1);
+        }
+        free(row_f32);
+    } else {
+        // Fallback to scalar loop if malloc fails
+        for (int i = 0; i < M; i++) {
+            float sum = 0.0f;
+            const uint16_t *row = A + i * K;
+            for (int k = 0; k < K; k++) {
+                sum += bf16_to_f32(row[k]) * x[k];
+            }
+            y[i] = sum;
+        }
+    }
+#else
     // y[i] = sum_k A[i,k] * x[k], where A is in BF16
     for (int i = 0; i < M; i++) {
         float sum = 0.0f;
@@ -134,6 +170,7 @@ void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int 
         }
         y[i] = sum;
     }
+#endif
 }
 
 void gemma3_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
@@ -403,10 +440,14 @@ void gemma3_gqa(float *output, const float *q,
         // So k at position i, kv_head h is at: k_cache[i * kv_stride + kv_head * head_dim]
         for (int i = 0; i < seq_len; i++) {
             const float *k_pos = k_cache + i * kv_stride + kv_head * head_dim;
+#ifdef USE_BLAS
+            float score = cblas_sdot(head_dim, q_head, 1, k_pos, 1);
+#else
             float score = 0.0f;
             for (int d = 0; d < head_dim; d++) {
                 score += q_head[d] * k_pos[d];
             }
+#endif
             scores[i] = score * scale;
 
             // Apply mask if provided
@@ -424,9 +465,13 @@ void gemma3_gqa(float *output, const float *q,
         for (int i = 0; i < seq_len; i++) {
             const float *v_pos = v_cache + i * kv_stride + kv_head * head_dim;
             float w = scores[i];
+#ifdef USE_BLAS
+            cblas_saxpy(head_dim, w, v_pos, 1, out_head, 1);
+#else
             for (int d = 0; d < head_dim; d++) {
                 out_head[d] += w * v_pos[d];
             }
+#endif
         }
     }
 
@@ -638,11 +683,15 @@ float gemma3_vec_max(const float *x, int n) {
 }
 
 float gemma3_dot(const float *a, const float *b, int n) {
+#ifdef USE_BLAS
+    return cblas_sdot(n, a, 1, b, 1);
+#else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
         sum += a[i] * b[i];
     }
     return sum;
+#endif
 }
 
 void gemma3_set_seed(uint64_t seed) {

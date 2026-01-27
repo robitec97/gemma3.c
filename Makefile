@@ -4,6 +4,7 @@
 #   make          - Build with default settings
 #   make debug    - Build with debug symbols
 #   make fast     - Build with aggressive optimizations
+#   make blas     - Build with OpenBLAS acceleration
 #   make clean    - Remove build artifacts
 
 # Compiler
@@ -51,16 +52,11 @@ ifeq ($(UNAME_S),Linux)
     LDFLAGS += -lpthread
 endif
 
-# Optional: OpenBLAS support
-# Uncomment these lines and ensure OpenBLAS is installed
-# CFLAGS_BASE += -DUSE_BLAS
-# LDFLAGS += -lopenblas
-
 # Default build
 CFLAGS = $(CFLAGS_BASE) $(CFLAGS_RELEASE)
 
 # Targets
-.PHONY: all debug fast clean help
+.PHONY: all debug fast blas clean help
 
 all: $(TARGET)
 
@@ -69,6 +65,10 @@ debug: $(TARGET)
 
 fast: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_FAST)
 fast: $(TARGET)
+
+blas: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_FAST) -DUSE_BLAS
+blas: LDFLAGS += -lopenblas
+blas: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
@@ -88,6 +88,7 @@ help:
 	@echo "  all     - Build with release optimizations (default)"
 	@echo "  debug   - Build with debug symbols (-g -O0)"
 	@echo "  fast    - Build with aggressive optimizations (-O3 -march=native -ffast-math)"
+	@echo "  blas    - Build with OpenBLAS acceleration (requires libopenblas-dev)"
 	@echo "  clean   - Remove build artifacts"
 	@echo "  help    - Show this help message"
 	@echo ""
@@ -98,6 +99,7 @@ help:
 	@echo "  make              # Build release version"
 	@echo "  make debug        # Build debug version"
 	@echo "  make fast         # Build optimized for local CPU"
+	@echo "  make blas         # Build with OpenBLAS support"
 	@echo "  make clean        # Clean build files"
 	@echo ""
 	@echo "After building, run:"

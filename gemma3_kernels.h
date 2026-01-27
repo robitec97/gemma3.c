@@ -11,6 +11,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef USE_BLAS
+#include <cblas.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
