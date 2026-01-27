@@ -1,115 +1,127 @@
 # Makefile for gemma3.c
 #
-# Build targets:
-#   make          - Build with default settings
-#   make debug    - Build with debug symbols
-#   make fast     - Build with aggressive optimizations
-#   make blas     - Build with OpenBLAS acceleration
-#   make clean    - Remove build artifacts
+# Usage:
+#   make                - Build release (default)
+#   make debug          - Build with debug symbols
+#   make fast           - Build with aggressive optimizations
+#   make blas           - Build with OpenBLAS
+#   make threads        - Build with thread pool
+#   make blas-threads   - Build with OpenBLAS + thread pool
+#   make clean          - Remove all build artifacts
 
-# Compiler
+# --- Configuration ---
+
 CC ?= gcc
+TARGET ?= gemma3
+BUILD_DIR ?= build
 
-# Project name
-TARGET = gemma3
+# Base Sources
+SRCS_BASE = gemma3.c \
+            gemma3_kernels.c \
+            gemma3_safetensors.c \
+            gemma3_tokenizer.c \
+            gemma3_transformer.c \
+            main.c
 
-# Source files
-SRCS = gemma3.c \
-       gemma3_kernels.c \
-       gemma3_safetensors.c \
-       gemma3_tokenizer.c \
-       gemma3_transformer.c \
-       main.c
-
-# Object files
-OBJS = $(SRCS:.c=.o)
-
-# Header files
-HDRS = gemma3.h gemma3_kernels.h
-
-# Compiler flags
-CFLAGS_BASE = -Wall -Wextra -Wpedantic -std=c11
+# Base Flags
+CFLAGS_BASE    = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP
 CFLAGS_RELEASE = -O3 -DNDEBUG
-CFLAGS_DEBUG = -g -O0 -DDEBUG
-CFLAGS_FAST = -O3 -march=native -ffast-math -DNDEBUG
+CFLAGS_DEBUG   = -g -O0 -DDEBUG
+CFLAGS_FAST    = -O3 -march=native -ffast-math -DNDEBUG
 
-# Linker flags
-LDFLAGS = -lm
+LDFLAGS_BASE   = -lm
 
-# Platform detection
-UNAME_S := $(shell uname -s)
+# --- Mode Logic (The Core Fix) ---
 
-ifeq ($(UNAME_S),Darwin)
-    # macOS specific flags
-    CFLAGS_BASE += -D_DARWIN_C_SOURCE
-    # Uncomment to enable Metal support (requires gemma3_metal.m)
-    # LDFLAGS += -framework Foundation -framework Metal -framework MetalKit
+# Default mode is release
+MODE ?= release
+
+# Initialize variables based on defaults
+CFLAGS = $(CFLAGS_BASE)
+LDFLAGS = $(LDFLAGS_BASE)
+SRCS = $(SRCS_BASE)
+
+# Apply Mode-Specific configurations
+# This runs only when the recursive make is called with MODE set
+
+ifeq ($(MODE),release)
+    CFLAGS += $(CFLAGS_RELEASE)
 endif
 
-ifeq ($(UNAME_S),Linux)
-    # Linux specific flags
-    CFLAGS_BASE += -D_GNU_SOURCE
-    LDFLAGS += -lpthread
+ifeq ($(MODE),debug)
+    CFLAGS += $(CFLAGS_DEBUG)
 endif
 
-# Default build
-CFLAGS = $(CFLAGS_BASE) $(CFLAGS_RELEASE)
+ifeq ($(MODE),fast)
+    CFLAGS += $(CFLAGS_FAST)
+endif
 
-# Targets
-.PHONY: all debug fast blas clean help
+# Check for BLAS in the mode string
+ifneq (,$(findstring blas,$(MODE)))
+    CFLAGS += $(CFLAGS_FAST) -DUSE_BLAS
+    LDFLAGS += -lopenblas
+endif
 
-all: $(TARGET)
+# Check for THREADS in the mode string
+ifneq (,$(findstring threads,$(MODE)))
+    CFLAGS += $(CFLAGS_FAST) -DUSE_THREADS
+    SRCS += gemma3_threads.c
+endif
 
-debug: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_DEBUG)
-debug: $(TARGET)
+# Calculate Objects based on the current MODE
+# Result: build/blas-threads/gemma3.o, etc.
+OBJS = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS))
 
-fast: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_FAST)
-fast: $(TARGET)
+# --- Convenience Targets ---
+# These targets just re-run make with a specific MODE
 
-blas: CFLAGS = $(CFLAGS_BASE) $(CFLAGS_FAST) -DUSE_BLAS
-blas: LDFLAGS += -lopenblas
-blas: $(TARGET)
+.PHONY: all debug fast blas threads blas-threads clean help
+
+all:
+	@$(MAKE) --no-print-directory build_core MODE=release
+
+debug:
+	@$(MAKE) --no-print-directory build_core MODE=debug
+
+fast:
+	@$(MAKE) --no-print-directory build_core MODE=fast
+
+blas:
+	@$(MAKE) --no-print-directory build_core MODE=blas
+
+threads:
+	@$(MAKE) --no-print-directory build_core MODE=threads
+
+blas-threads:
+	@$(MAKE) --no-print-directory build_core MODE=blas-threads
+
+# --- The Real Build Target ---
+
+# This target does the actual work. 
+# It expects MODE to be set correctly by the calls above.
+build_core: $(TARGET)
 
 $(TARGET): $(OBJS)
+	@echo "Linking $(TARGET) [$(MODE)]..."
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
-%.o: %.c $(HDRS)
+# The Compilation Rule
+# Now we can explicitly use $(MODE) in the path because it is constant for this run
+$(BUILD_DIR)/$(MODE)/%.o: %.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Clean build artifacts
+# Include dependencies
+-include $(wildcard $(BUILD_DIR)/*/*.d)
+
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf $(TARGET) $(BUILD_DIR)
 
-# Help target
 help:
-	@echo "Gemma 3 C Inference - Build System"
-	@echo ""
 	@echo "Available targets:"
-	@echo "  all     - Build with release optimizations (default)"
-	@echo "  debug   - Build with debug symbols (-g -O0)"
-	@echo "  fast    - Build with aggressive optimizations (-O3 -march=native -ffast-math)"
-	@echo "  blas    - Build with OpenBLAS acceleration (requires libopenblas-dev)"
-	@echo "  clean   - Remove build artifacts"
-	@echo "  help    - Show this help message"
-	@echo ""
-	@echo "Environment variables:"
-	@echo "  CC      - C compiler (default: gcc)"
-	@echo ""
-	@echo "Usage:"
-	@echo "  make              # Build release version"
-	@echo "  make debug        # Build debug version"
-	@echo "  make fast         # Build optimized for local CPU"
-	@echo "  make blas         # Build with OpenBLAS support"
-	@echo "  make clean        # Clean build files"
-	@echo ""
-	@echo "After building, run:"
-	@echo "  ./gemma3 -m <model_dir> -p \"Your prompt\""
-	@echo "  ./gemma3 -m <model_dir> -i  # Interactive mode"
-
-# Dependencies (auto-generated would be better, but keeping it simple)
-gemma3.o: gemma3.c gemma3.h gemma3_kernels.h
-gemma3_kernels.o: gemma3_kernels.c gemma3_kernels.h
-gemma3_safetensors.o: gemma3_safetensors.c gemma3.h gemma3_kernels.h
-gemma3_tokenizer.o: gemma3_tokenizer.c gemma3.h
-gemma3_transformer.o: gemma3_transformer.c gemma3.h gemma3_kernels.h
-main.o: main.c gemma3.h
+	@echo "  make              : Release build"
+	@echo "  make debug        : Debug build"
+	@echo "  make fast         : Native optimizations"
+	@echo "  make blas         : OpenBLAS"
+	@echo "  make threads      : Thread pool"
+	@echo "  make blas-threads : OpenBLAS + Threads"

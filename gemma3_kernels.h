@@ -15,6 +15,10 @@
 #include <cblas.h>
 #endif
 
+#ifdef USE_THREADS
+#include "gemma3_threads.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -184,7 +188,7 @@ void gemma3_attention_single(float *output, const float *q,
 void gemma3_gqa(float *output, const float *q,
                 const float *k_cache, const float *v_cache,
                 int n_heads, int n_kv_heads, int seq_len, int head_dim,
-                float scale, const float *mask);
+                float scale, const float *mask, float *scores_buf);
 
 /**
  * Sliding window attention mask generation
@@ -210,7 +214,17 @@ void gemma3_causal_mask(float *mask, int seq_len, int query_pos);
  * A: [M, K] in BF16, x: [K] in F32, y: [M] in F32
  * Converts BF16 to F32 on-the-fly during computation
  */
-void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K);
+void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K,
+                        float *scratch);
+
+#ifdef USE_THREADS
+/**
+ * Threaded matrix-vector multiplication with BF16 matrix.
+ * Splits rows across pool threads. Falls back to single-threaded if pool is NULL.
+ */
+void gemma3_matvec_bf16_mt(float *y, const uint16_t *A, const float *x, int M, int K,
+                           float *scratch, gemma3_thread_pool *pool);
+#endif
 
 /**
  * RMS Normalization with BF16 weights: y = x * rsqrt(mean(x^2) + eps) * weight

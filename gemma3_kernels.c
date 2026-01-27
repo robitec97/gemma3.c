@@ -11,6 +11,10 @@
 #include <string.h>
 #include <float.h>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 /* Random state for sampling */
 static uint64_t g_rng_state = 12345678901234567ULL;
 
@@ -135,10 +139,69 @@ static inline float bf16_to_f32(uint16_t bf16) {
     return result;
 }
 
-void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K) {
+#ifdef __AVX2__
+/* AVX2: Fused BF16-to-F32 conversion + dot product.
+ * Processes 8 BF16 elements at a time: load 8x uint16 -> zero-extend to 32-bit
+ * -> shift left 16 -> reinterpret as float -> FMA with x vector. */
+static float avx2_bf16_dot(const uint16_t *a_bf16, const float *x, int K) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    int k = 0;
+    /* Process 16 elements per iteration (2x8 for better ILP) */
+    for (; k + 15 < K; k += 16) {
+        /* Load 8 BF16 values, zero-extend to 32-bit, shift left 16 to get F32 */
+        __m128i bf16_lo = _mm_loadu_si128((const __m128i *)(a_bf16 + k));
+        __m256i i32_lo = _mm256_cvtepu16_epi32(bf16_lo);
+        __m256i f32_bits_lo = _mm256_slli_epi32(i32_lo, 16);
+        __m256 a_lo = _mm256_castsi256_ps(f32_bits_lo);
+        __m256 x_lo = _mm256_loadu_ps(x + k);
+        acc0 = _mm256_fmadd_ps(a_lo, x_lo, acc0);
+
+        __m128i bf16_hi = _mm_loadu_si128((const __m128i *)(a_bf16 + k + 8));
+        __m256i i32_hi = _mm256_cvtepu16_epi32(bf16_hi);
+        __m256i f32_bits_hi = _mm256_slli_epi32(i32_hi, 16);
+        __m256 a_hi = _mm256_castsi256_ps(f32_bits_hi);
+        __m256 x_hi = _mm256_loadu_ps(x + k + 8);
+        acc1 = _mm256_fmadd_ps(a_hi, x_hi, acc1);
+    }
+    /* Process remaining 8-element chunks */
+    for (; k + 7 < K; k += 8) {
+        __m128i bf16_v = _mm_loadu_si128((const __m128i *)(a_bf16 + k));
+        __m256i i32_v = _mm256_cvtepu16_epi32(bf16_v);
+        __m256i f32_bits = _mm256_slli_epi32(i32_v, 16);
+        __m256 a_v = _mm256_castsi256_ps(f32_bits);
+        __m256 x_v = _mm256_loadu_ps(x + k);
+        acc0 = _mm256_fmadd_ps(a_v, x_v, acc0);
+    }
+
+    /* Horizontal sum of acc0 + acc1 */
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 hi128 = _mm256_extractf128_ps(acc0, 1);
+    __m128 lo128 = _mm256_castps256_ps128(acc0);
+    __m128 sum4 = _mm_add_ps(lo128, hi128);
+    __m128 sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+    __m128 sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
+    float result = _mm_cvtss_f32(sum1);
+
+    /* Scalar tail */
+    for (; k < K; k++) {
+        result += bf16_to_f32(a_bf16[k]) * x[k];
+    }
+    return result;
+}
+#endif /* __AVX2__ */
+
+void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int K,
+                        float *scratch) {
 #ifdef USE_BLAS
-    // Allocate a single row buffer for BF16->F32 conversion
-    float *row_f32 = (float *)malloc(K * sizeof(float));
+    // Use pre-allocated scratch buffer for BF16->F32 conversion (avoids malloc per call)
+    float *row_f32 = scratch;
+    int need_free = 0;
+    if (!row_f32) {
+        row_f32 = (float *)malloc(K * sizeof(float));
+        need_free = 1;
+    }
     if (row_f32) {
         for (int i = 0; i < M; i++) {
             const uint16_t *row = A + i * K;
@@ -148,7 +211,7 @@ void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int 
             }
             y[i] = cblas_sdot(K, row_f32, 1, x, 1);
         }
-        free(row_f32);
+        if (need_free) free(row_f32);
     } else {
         // Fallback to scalar loop if malloc fails
         for (int i = 0; i < M; i++) {
@@ -161,7 +224,14 @@ void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int 
         }
     }
 #else
-    // y[i] = sum_k A[i,k] * x[k], where A is in BF16
+    (void)scratch;
+#ifdef __AVX2__
+    // AVX2 path: fused BF16->F32 + FMA dot product
+    for (int i = 0; i < M; i++) {
+        y[i] = avx2_bf16_dot(A + i * K, x, K);
+    }
+#else
+    // Scalar fallback: y[i] = sum_k A[i,k] * x[k], where A is in BF16
     for (int i = 0; i < M; i++) {
         float sum = 0.0f;
         const uint16_t *row = A + i * K;
@@ -170,8 +240,51 @@ void gemma3_matvec_bf16(float *y, const uint16_t *A, const float *x, int M, int 
         }
         y[i] = sum;
     }
-#endif
+#endif /* __AVX2__ */
+#endif /* USE_BLAS */
 }
+
+#ifdef USE_THREADS
+/* Thread task argument for parallel matvec */
+typedef struct {
+    float *y;
+    const uint16_t *A;
+    const float *x;
+    int M;
+    int K;
+} matvec_bf16_task_t;
+
+static void matvec_bf16_worker(void *arg, int thread_idx, int num_threads) {
+    matvec_bf16_task_t *t = (matvec_bf16_task_t *)arg;
+    int rows_per_thread = (t->M + num_threads - 1) / num_threads;
+    int start = thread_idx * rows_per_thread;
+    int end = start + rows_per_thread;
+    if (end > t->M) end = t->M;
+
+    for (int i = start; i < end; i++) {
+#ifdef __AVX2__
+        t->y[i] = avx2_bf16_dot(t->A + i * t->K, t->x, t->K);
+#else
+        const uint16_t *row = t->A + i * t->K;
+        float sum = 0.0f;
+        for (int k = 0; k < t->K; k++) {
+            sum += bf16_to_f32(row[k]) * t->x[k];
+        }
+        t->y[i] = sum;
+#endif
+    }
+}
+
+void gemma3_matvec_bf16_mt(float *y, const uint16_t *A, const float *x, int M, int K,
+                           float *scratch, gemma3_thread_pool *pool) {
+    if (!pool || gemma3_thread_pool_size(pool) <= 1) {
+        gemma3_matvec_bf16(y, A, x, M, K, scratch);
+        return;
+    }
+    matvec_bf16_task_t task = { y, A, x, M, K };
+    gemma3_thread_pool_run(pool, matvec_bf16_worker, &task);
+}
+#endif /* USE_THREADS */
 
 void gemma3_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
                          int n, float eps) {
@@ -414,7 +527,7 @@ void gemma3_attention_single(float *output, const float *q,
 void gemma3_gqa(float *output, const float *q,
                 const float *k_cache, const float *v_cache,
                 int n_heads, int n_kv_heads, int seq_len, int head_dim,
-                float scale, const float *mask) {
+                float scale, const float *mask, float *scores_buf) {
     // Grouped Query Attention
     // n_heads query heads share n_kv_heads KV heads
     //
@@ -424,8 +537,13 @@ void gemma3_gqa(float *output, const float *q,
     int heads_per_group = n_heads / n_kv_heads;
     int kv_stride = n_kv_heads * head_dim;  // Stride between sequence positions
 
-    // Allocate temporary storage for attention scores
-    float *scores = (float *)malloc(seq_len * sizeof(float));
+    // Use pre-allocated scores buffer to avoid malloc/free per token
+    float *scores = scores_buf;
+    int need_free = 0;
+    if (!scores) {
+        scores = (float *)malloc(seq_len * sizeof(float));
+        need_free = 1;
+    }
     if (!scores) return;
 
     for (int h = 0; h < n_heads; h++) {
@@ -475,7 +593,7 @@ void gemma3_gqa(float *output, const float *q,
         }
     }
 
-    free(scores);
+    if (need_free) free(scores);
 }
 
 void gemma3_sliding_window_mask(float *mask, int query_pos, int window_size) {
@@ -549,29 +667,59 @@ static int compare_indexed_float_desc(const void *a, const void *b) {
 void gemma3_topk_filter(float *logits, int vocab_size, int k) {
     if (k <= 0 || k >= vocab_size) return;
 
-    // Create indexed array
-    IndexedFloat *indexed = (IndexedFloat *)malloc(vocab_size * sizeof(IndexedFloat));
-    if (!indexed) return;
+    /* Min-heap of size k to find the k-th largest value in O(n log k).
+     * The heap root is the smallest of the top-k values (the threshold). */
+    float *heap = (float *)malloc(k * sizeof(float));
+    if (!heap) return;
 
-    for (int i = 0; i < vocab_size; i++) {
-        indexed[i].value = logits[i];
-        indexed[i].index = i;
+    /* Initialize heap with first k elements */
+    for (int i = 0; i < k; i++) {
+        heap[i] = logits[i];
     }
 
-    // Sort by value descending
-    qsort(indexed, vocab_size, sizeof(IndexedFloat), compare_indexed_float_desc);
+    /* Build min-heap (heapify) */
+    for (int i = k / 2 - 1; i >= 0; i--) {
+        int pos = i;
+        while (1) {
+            int smallest = pos;
+            int left = 2 * pos + 1;
+            int right = 2 * pos + 2;
+            if (left < k && heap[left] < heap[smallest]) smallest = left;
+            if (right < k && heap[right] < heap[smallest]) smallest = right;
+            if (smallest == pos) break;
+            float tmp = heap[pos]; heap[pos] = heap[smallest]; heap[smallest] = tmp;
+            pos = smallest;
+        }
+    }
 
-    // Find threshold (k-th largest value)
-    float threshold = indexed[k - 1].value;
+    /* Process remaining elements: if larger than heap root, replace and sift down */
+    for (int i = k; i < vocab_size; i++) {
+        if (logits[i] > heap[0]) {
+            heap[0] = logits[i];
+            int pos = 0;
+            while (1) {
+                int smallest = pos;
+                int left = 2 * pos + 1;
+                int right = 2 * pos + 2;
+                if (left < k && heap[left] < heap[smallest]) smallest = left;
+                if (right < k && heap[right] < heap[smallest]) smallest = right;
+                if (smallest == pos) break;
+                float tmp = heap[pos]; heap[pos] = heap[smallest]; heap[smallest] = tmp;
+                pos = smallest;
+            }
+        }
+    }
 
-    // Set logits below threshold to -inf
+    /* heap[0] is now the k-th largest value */
+    float threshold = heap[0];
+    free(heap);
+
+    /* Set logits below threshold to -inf */
     for (int i = 0; i < vocab_size; i++) {
         if (logits[i] < threshold) {
             logits[i] = -INFINITY;
         }
     }
-
-    free(indexed);
 }
 
 void gemma3_topp_filter(float *logits, int vocab_size, float p) {
