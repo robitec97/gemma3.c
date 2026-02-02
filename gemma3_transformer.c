@@ -11,10 +11,27 @@
 
 #include "gemma3.h"
 #include "gemma3_kernels.h"
+#ifdef USE_THREADS
+#include "gemma3_threads.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* Helper to dispatch matvec_bf16 to threaded or single-threaded path */
+static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float *x,
+                                         int M, int K, float *scratch, void *pool) {
+#ifdef USE_THREADS
+    if (pool) {
+        gemma3_matvec_bf16_mt(y, A, x, M, K, scratch, (gemma3_thread_pool *)pool);
+        return;
+    }
+#else
+    (void)pool;
+#endif
+    gemma3_matvec_bf16(y, A, x, M, K, scratch);
+}
 
 /* ============================================================================
  * Internal Structures (shared with gemma3.c)
@@ -72,6 +89,8 @@ typedef struct {
     float *mlp_out;     /* [hidden_size] - MLP output */
     float *logits;      /* [vocab_size] - output logits */
     float *mask;        /* [max_seq] - attention mask */
+    float *attn_scores; /* [max_context] - pre-allocated attention scores */
+    float *matvec_tmp;  /* [vocab_size] - scratch buffer for BF16 matvec BLAS path */
 } activation_buffers;
 
 static activation_buffers *alloc_buffers(const gemma3_config *cfg) {
@@ -90,10 +109,15 @@ static activation_buffers *alloc_buffers(const gemma3_config *cfg) {
     buf->mlp_out = (float *)malloc(cfg->hidden_size * sizeof(float));
     buf->logits = (float *)malloc(cfg->vocab_size * sizeof(float));
     buf->mask = (float *)malloc(cfg->max_context * sizeof(float));
+    buf->attn_scores = (float *)malloc(cfg->max_context * sizeof(float));
+    /* vocab_size is the largest row dimension for matvec; reuse for BF16 conversion */
+    int matvec_max = cfg->vocab_size > cfg->intermediate_size ? cfg->vocab_size : cfg->intermediate_size;
+    buf->matvec_tmp = (float *)malloc(matvec_max * sizeof(float));
 
     if (!buf->x || !buf->x_norm || !buf->q || !buf->k || !buf->v ||
         !buf->attn_out || !buf->proj_out || !buf->mlp_gate || !buf->mlp_up ||
-        !buf->mlp_out || !buf->logits || !buf->mask) {
+        !buf->mlp_out || !buf->logits || !buf->mask || !buf->attn_scores ||
+        !buf->matvec_tmp) {
         free(buf->x);
         free(buf->x_norm);
         free(buf->q);
@@ -106,6 +130,8 @@ static activation_buffers *alloc_buffers(const gemma3_config *cfg) {
         free(buf->mlp_out);
         free(buf->logits);
         free(buf->mask);
+        free(buf->attn_scores);
+        free(buf->matvec_tmp);
         free(buf);
         return NULL;
     }
@@ -127,6 +153,8 @@ static void free_buffers(activation_buffers *buf) {
     free(buf->mlp_out);
     free(buf->logits);
     free(buf->mask);
+    free(buf->attn_scores);
+    free(buf->matvec_tmp);
     free(buf);
 }
 
@@ -227,6 +255,10 @@ static void layer_attention(
     float *v_buf,            /* [num_kv_heads * head_dim] */
     float *attn_buf,         /* [num_heads * head_dim] */
     float *mask_buf,         /* [max_seq] */
+    float *scores_buf,       /* [max_seq] - pre-allocated attention scores */
+    float *matvec_tmp,       /* scratch buffer for BF16 matvec */
+    const float *rope_freqs, /* precomputed RoPE cos/sin table */
+    void *thread_pool,       /* gemma3_thread_pool* or NULL */
     const gemma3_config *cfg,
     int layer_idx,
     int pos
@@ -240,9 +272,9 @@ static void layer_attention(
     int kv_size = num_kv_heads * head_dim;
 
     /* Project Q, K, V (BF16 weights) */
-    gemma3_matvec_bf16(q_buf, q_weight, x, q_size, hidden_size);
-    gemma3_matvec_bf16(k_buf, k_weight, x, kv_size, hidden_size);
-    gemma3_matvec_bf16(v_buf, v_weight, x, kv_size, hidden_size);
+    matvec_bf16_dispatch(q_buf, q_weight, x, q_size, hidden_size, matvec_tmp, thread_pool);
+    matvec_bf16_dispatch(k_buf, k_weight, x, kv_size, hidden_size, matvec_tmp, thread_pool);
+    matvec_bf16_dispatch(v_buf, v_weight, x, kv_size, hidden_size, matvec_tmp, thread_pool);
 
     /* Apply QK normalization (per-head RMSNorm with BF16 weights) */
     if (q_norm && k_norm) {
@@ -256,12 +288,16 @@ static void layer_attention(
         }
     }
 
-    /* Apply RoPE */
-    int is_global = gemma3_is_global_layer(layer_idx);
-    float theta = is_global ? cfg->rope_theta_global : cfg->rope_theta_local;
-    gemma3_rope(q_buf, k_buf, num_heads, num_kv_heads, head_dim, pos, theta);
+    /* Apply RoPE using precomputed cos/sin tables */
+    for (int h = 0; h < num_heads; h++) {
+        gemma3_rope_apply_precomputed(q_buf + h * head_dim, rope_freqs, head_dim, pos);
+    }
+    for (int h = 0; h < num_kv_heads; h++) {
+        gemma3_rope_apply_precomputed(k_buf + h * head_dim, rope_freqs, head_dim, pos);
+    }
 
     /* Add K, V to cache */
+    int is_global = gemma3_is_global_layer(layer_idx);
     cache_kv(cache, k_buf, v_buf, kv_size, is_global, cfg->sliding_window, pos);
 
     /* Determine attention range */
@@ -298,10 +334,10 @@ static void layer_attention(
     float scale = 1.0f / sqrtf((float)head_dim);
     gemma3_gqa(attn_buf, q_buf, k_cache, v_cache,
                num_heads, num_kv_heads, seq_len, head_dim,
-               scale, mask_buf);
+               scale, mask_buf, scores_buf);
 
     /* Output projection (BF16 weights) */
-    gemma3_matvec_bf16(output, o_weight, attn_buf, hidden_size, q_size);
+    matvec_bf16_dispatch(output, o_weight, attn_buf, hidden_size, q_size, matvec_tmp, thread_pool);
 }
 
 /* ============================================================================
@@ -316,6 +352,8 @@ static void layer_mlp(
     const uint16_t *down_weight, /* [hidden_size, intermediate_size] BF16 */
     float *gate_buf,          /* [intermediate_size] */
     float *up_buf,            /* [intermediate_size] */
+    float *matvec_tmp,        /* scratch buffer for BF16 matvec */
+    void *thread_pool,        /* gemma3_thread_pool* or NULL */
     const gemma3_config *cfg,
     int layer_idx,
     int pos
@@ -324,8 +362,8 @@ static void layer_mlp(
     int intermediate_size = cfg->intermediate_size;
 
     /* Gate and up projections (BF16 weights) */
-    gemma3_matvec_bf16(gate_buf, gate_weight, x, intermediate_size, hidden_size);
-    gemma3_matvec_bf16(up_buf, up_weight, x, intermediate_size, hidden_size);
+    matvec_bf16_dispatch(gate_buf, gate_weight, x, intermediate_size, hidden_size, matvec_tmp, thread_pool);
+    matvec_bf16_dispatch(up_buf, up_weight, x, intermediate_size, hidden_size, matvec_tmp, thread_pool);
 
     /* SwiGLU: gate = SiLU(gate) * up */
     /* Gemma 3 uses GELU instead of SiLU for the gate */
@@ -333,7 +371,7 @@ static void layer_mlp(
     gemma3_vec_mul(gate_buf, gate_buf, up_buf, intermediate_size);
 
     /* Down projection (BF16 weights) */
-    gemma3_matvec_bf16(output, down_weight, gate_buf, hidden_size, intermediate_size);
+    matvec_bf16_dispatch(output, down_weight, gate_buf, hidden_size, intermediate_size, matvec_tmp, thread_pool);
 
     (void)layer_idx;
     (void)pos;
@@ -345,13 +383,17 @@ static void layer_mlp(
 
 /* Forward pass for a single token */
 int gemma3_transformer_forward(
-    float *logits,            /* Output: [vocab_size] */
+    float *logits,            /* Output: [vocab_size] (only written if compute_logits) */
     int token_id,             /* Input token */
     int pos,                  /* Position in sequence */
     const gemma3_weights_t *weights,
     gemma3_kv_cache *cache,
     activation_buffers *buf,
-    const gemma3_config *cfg
+    const gemma3_config *cfg,
+    int compute_logits,       /* If false, skip final norm + vocab projection */
+    const float *rope_freqs_local,  /* precomputed RoPE for local layers */
+    const float *rope_freqs_global, /* precomputed RoPE for global layers */
+    void *thread_pool               /* gemma3_thread_pool* or NULL */
 ) {
     int hidden_size = cfg->hidden_size;
     int vocab_size = cfg->vocab_size;
@@ -389,6 +431,7 @@ int gemma3_transformer_forward(
                             hidden_size, cfg->rmsnorm_eps);
 
         /* Attention */
+        const float *rope_freqs = gemma3_is_global_layer(l) ? rope_freqs_global : rope_freqs_local;
         layer_attention(
             buf->proj_out,
             buf->x_norm,
@@ -396,6 +439,8 @@ int gemma3_transformer_forward(
             layer_weights_q_norm, layer_weights_k_norm,
             &cache->layers[l],
             buf->q, buf->k, buf->v, buf->attn_out, buf->mask,
+            buf->attn_scores, buf->matvec_tmp,
+            rope_freqs, thread_pool,
             cfg, l, pos
         );
 
@@ -424,6 +469,7 @@ int gemma3_transformer_forward(
             buf->x_norm,
             layer_weights_gate, layer_weights_up, layer_weights_down,
             buf->mlp_gate, buf->mlp_up,
+            buf->matvec_tmp, thread_pool,
             cfg, l, pos
         );
 
@@ -437,15 +483,294 @@ int gemma3_transformer_forward(
         gemma3_vec_add(buf->x, buf->x, buf->mlp_out, hidden_size);
     }
 
-    /* Final RMSNorm (BF16 weights) */
-    gemma3_rmsnorm_bf16(buf->x_norm, buf->x, weights->norm, hidden_size, cfg->rmsnorm_eps);
+    /* Skip final norm + vocab projection during prefill (non-last tokens) */
+    if (compute_logits) {
+        /* Final RMSNorm (BF16 weights) */
+        gemma3_rmsnorm_bf16(buf->x_norm, buf->x, weights->norm, hidden_size, cfg->rmsnorm_eps);
 
-    /* Output projection (tied embeddings, BF16) */
-    /* logits = x_norm @ embed_tokens.T */
-    gemma3_matvec_bf16(logits, weights->embed_tokens, buf->x_norm, vocab_size, hidden_size);
+        /* Output projection (tied embeddings, BF16) */
+        /* logits = x_norm @ embed_tokens.T */
+        matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm, vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
+    }
 
     return 0;
 }
+
+/* Convert a BF16 weight matrix to F32 into a pre-allocated buffer */
+static void bf16_matrix_to_f32(float *dst, const uint16_t *src, int rows, int cols) {
+    int n = rows * cols;
+    for (int i = 0; i < n; i++) {
+        uint32_t bits = ((uint32_t)src[i]) << 16;
+        __builtin_memcpy(&dst[i], &bits, sizeof(float));
+    }
+}
+
+#ifdef USE_BLAS
+/* Batched prefill: process all tokens through each layer using sgemm.
+ * Linear projections become matrix-matrix multiplies; attention remains per-token. */
+static int gemma3_transformer_prefill_batched(
+    float *logits,
+    const int *tokens,
+    int num_tokens,
+    int start_pos,
+    const gemma3_weights_t *weights,
+    gemma3_kv_cache *cache,
+    activation_buffers *buf,
+    const gemma3_config *cfg,
+    const float *rope_freqs_local,
+    const float *rope_freqs_global,
+    void *thread_pool
+) {
+    (void)thread_pool;
+
+    int hidden_size = cfg->hidden_size;
+    int intermediate_size = cfg->intermediate_size;
+    int num_heads = cfg->num_heads;
+    int num_kv_heads = cfg->num_kv_heads;
+    int head_dim = cfg->head_dim;
+    int q_size = num_heads * head_dim;
+    int kv_size = num_kv_heads * head_dim;
+    int N = num_tokens;
+
+    /* Allocate batched activation matrices:
+     * X: [N, hidden_size], X_norm: [N, hidden_size]
+     * Q_all: [N, q_size], K_all: [N, kv_size], V_all: [N, kv_size]
+     * attn_out_all: [N, q_size], proj_out_all: [N, hidden_size]
+     * gate_all: [N, intermediate_size], up_all: [N, intermediate_size]
+     * mlp_out_all: [N, hidden_size] */
+    size_t total_size = (size_t)N * (
+        hidden_size * 3 +       /* X, X_norm, proj_out */
+        q_size * 2 +            /* Q, attn_out */
+        kv_size * 2 +           /* K, V */
+        hidden_size +           /* mlp_out */
+        intermediate_size * 2   /* gate, up */
+    );
+    /* Weight conversion buffer: largest weight is embed [vocab_size, hidden_size] or
+     * intermediate [intermediate_size, hidden_size]. For per-layer we need max of:
+     * q_proj: [q_size, hidden_size], gate/up/down: [intermediate_size, hidden_size] */
+    int max_weight_elems = intermediate_size * hidden_size;
+    if (q_size * hidden_size > max_weight_elems) max_weight_elems = q_size * hidden_size;
+    if (hidden_size * q_size > max_weight_elems) max_weight_elems = hidden_size * q_size;
+    if (hidden_size * intermediate_size > max_weight_elems) max_weight_elems = hidden_size * intermediate_size;
+
+    float *batch_buf = (float *)malloc(total_size * sizeof(float));
+    float *weight_f32 = (float *)malloc(max_weight_elems * sizeof(float));
+    if (!batch_buf || !weight_f32) {
+        free(batch_buf);
+        free(weight_f32);
+        /* Fall back to sequential */
+        goto sequential_fallback;
+    }
+
+    /* Assign sub-buffers */
+    float *X       = batch_buf;
+    float *X_norm  = X + N * hidden_size;
+    float *Q_all   = X_norm + N * hidden_size;
+    float *K_all   = Q_all + N * q_size;
+    float *V_all   = K_all + N * kv_size;
+    float *attn_out_all = V_all + N * kv_size;
+    float *proj_out_all = attn_out_all + N * q_size;
+    float *gate_all = proj_out_all + N * hidden_size;
+    float *up_all  = gate_all + N * intermediate_size;
+    float *mlp_out_all = up_all + N * intermediate_size;
+
+    /* Embed all tokens: X[i] = embed(tokens[i]) * sqrt(hidden_size) */
+    float embed_scale = sqrtf((float)hidden_size);
+    for (int i = 0; i < N; i++) {
+        gemma3_embed_bf16(X + i * hidden_size, weights->embed_tokens, tokens[i], hidden_size);
+        for (int j = 0; j < hidden_size; j++) {
+            X[i * hidden_size + j] *= embed_scale;
+        }
+    }
+
+    /* Process each layer */
+    for (int l = 0; l < cfg->num_layers; l++) {
+        int is_global = gemma3_is_global_layer(l);
+        const float *rope_freqs = is_global ? rope_freqs_global : rope_freqs_local;
+
+        /* --- Pre-attention RMSNorm (per-token, no good way to batch) --- */
+        for (int i = 0; i < N; i++) {
+            gemma3_rmsnorm_bf16(X_norm + i * hidden_size,
+                                X + i * hidden_size,
+                                weights->layers[l].input_layernorm,
+                                hidden_size, cfg->rmsnorm_eps);
+        }
+
+        /* --- Batched QKV projection ---
+         * Q_all = X_norm @ q_proj^T  ->  [N, hidden_size] @ [hidden_size, q_size] = [N, q_size]
+         * Weight is stored [q_size, hidden_size] in BF16, so we convert it and
+         * compute: Q_all = X_norm * W^T using sgemm */
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].q_proj, q_size, hidden_size);
+        /* C = alpha * A * B^T + beta * C
+         * A = X_norm [N, hidden_size], B = weight_f32 [q_size, hidden_size]
+         * C = Q_all [N, q_size]
+         * We want C[i,j] = sum_k X_norm[i,k] * W[j,k] = X_norm * W^T
+         * sgemm: CblasNoTrans for A, CblasTrans for B */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, q_size, hidden_size,
+                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
+                    0.0f, Q_all, q_size);
+
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].k_proj, kv_size, hidden_size);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, kv_size, hidden_size,
+                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
+                    0.0f, K_all, kv_size);
+
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].v_proj, kv_size, hidden_size);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, kv_size, hidden_size,
+                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
+                    0.0f, V_all, kv_size);
+
+        /* --- Per-token: QK norm, RoPE, cache KV, attention --- */
+        float scale = 1.0f / sqrtf((float)head_dim);
+        for (int i = 0; i < N; i++) {
+            int pos = start_pos + i;
+            float *qi = Q_all + i * q_size;
+            float *ki = K_all + i * kv_size;
+            float *vi = V_all + i * kv_size;
+
+            /* QK normalization */
+            if (weights->layers[l].q_norm && weights->layers[l].k_norm) {
+                for (int h = 0; h < num_heads; h++) {
+                    gemma3_rmsnorm_bf16(qi + h * head_dim, qi + h * head_dim,
+                                        weights->layers[l].q_norm, head_dim, cfg->rmsnorm_eps);
+                }
+                for (int h = 0; h < num_kv_heads; h++) {
+                    gemma3_rmsnorm_bf16(ki + h * head_dim, ki + h * head_dim,
+                                        weights->layers[l].k_norm, head_dim, cfg->rmsnorm_eps);
+                }
+            }
+
+            /* RoPE */
+            for (int h = 0; h < num_heads; h++) {
+                gemma3_rope_apply_precomputed(qi + h * head_dim, rope_freqs, head_dim, pos);
+            }
+            for (int h = 0; h < num_kv_heads; h++) {
+                gemma3_rope_apply_precomputed(ki + h * head_dim, rope_freqs, head_dim, pos);
+            }
+
+            /* Cache KV */
+            cache_kv(&cache->layers[l], ki, vi, kv_size, is_global,
+                     cfg->sliding_window, pos);
+
+            /* Attention (must be sequential due to causal dependency on cache) */
+            int seq_len;
+            const float *k_cache, *v_cache;
+            if (is_global) {
+                seq_len = pos + 1;
+                k_cache = cache->layers[l].k;
+                v_cache = cache->layers[l].v;
+                gemma3_causal_mask(buf->mask, seq_len, pos);
+            } else {
+                int window = cfg->sliding_window;
+                seq_len = (pos < window) ? pos + 1 : window;
+                k_cache = cache->layers[l].k;
+                v_cache = cache->layers[l].v;
+                for (int s = 0; s < seq_len; s++) buf->mask[s] = 0.0f;
+            }
+
+            gemma3_gqa(attn_out_all + i * q_size, qi, k_cache, v_cache,
+                       num_heads, num_kv_heads, seq_len, head_dim,
+                       scale, buf->mask, buf->attn_scores);
+        }
+
+        /* --- Batched output projection: proj_out = attn_out @ o_proj^T --- */
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].o_proj, hidden_size, q_size);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, hidden_size, q_size,
+                    1.0f, attn_out_all, q_size, weight_f32, q_size,
+                    0.0f, proj_out_all, hidden_size);
+
+        /* Post-attention RMSNorm + residual */
+        for (int i = 0; i < N; i++) {
+            if (weights->layers[l].post_attention_layernorm) {
+                gemma3_rmsnorm_bf16_inplace(proj_out_all + i * hidden_size,
+                                            weights->layers[l].post_attention_layernorm,
+                                            hidden_size, cfg->rmsnorm_eps);
+            }
+            gemma3_vec_add(X + i * hidden_size, X + i * hidden_size,
+                           proj_out_all + i * hidden_size, hidden_size);
+        }
+
+        /* --- MLP Block --- */
+        /* Pre-feedforward RMSNorm */
+        for (int i = 0; i < N; i++) {
+            if (weights->layers[l].pre_feedforward_layernorm) {
+                gemma3_rmsnorm_bf16(X_norm + i * hidden_size,
+                                    X + i * hidden_size,
+                                    weights->layers[l].pre_feedforward_layernorm,
+                                    hidden_size, cfg->rmsnorm_eps);
+            } else {
+                gemma3_vec_copy(X_norm + i * hidden_size, X + i * hidden_size, hidden_size);
+            }
+        }
+
+        /* Batched gate + up projections */
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].gate_proj, intermediate_size, hidden_size);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, intermediate_size, hidden_size,
+                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
+                    0.0f, gate_all, intermediate_size);
+
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].up_proj, intermediate_size, hidden_size);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, intermediate_size, hidden_size,
+                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
+                    0.0f, up_all, intermediate_size);
+
+        /* SwiGLU activation (per-token) */
+        for (int i = 0; i < N; i++) {
+            gemma3_gelu_tanh_inplace(gate_all + i * intermediate_size, intermediate_size);
+            gemma3_vec_mul(gate_all + i * intermediate_size,
+                           gate_all + i * intermediate_size,
+                           up_all + i * intermediate_size, intermediate_size);
+        }
+
+        /* Batched down projection */
+        bf16_matrix_to_f32(weight_f32, weights->layers[l].down_proj, hidden_size, intermediate_size);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    N, hidden_size, intermediate_size,
+                    1.0f, gate_all, intermediate_size, weight_f32, intermediate_size,
+                    0.0f, mlp_out_all, hidden_size);
+
+        /* Post-feedforward RMSNorm + residual */
+        for (int i = 0; i < N; i++) {
+            if (weights->layers[l].post_feedforward_layernorm) {
+                gemma3_rmsnorm_bf16_inplace(mlp_out_all + i * hidden_size,
+                                            weights->layers[l].post_feedforward_layernorm,
+                                            hidden_size, cfg->rmsnorm_eps);
+            }
+            gemma3_vec_add(X + i * hidden_size, X + i * hidden_size,
+                           mlp_out_all + i * hidden_size, hidden_size);
+        }
+    }
+
+    /* Final: compute logits only for the last token */
+    int last = N - 1;
+    gemma3_rmsnorm_bf16(buf->x_norm, X + last * hidden_size, weights->norm,
+                        hidden_size, cfg->rmsnorm_eps);
+    gemma3_matvec_bf16(logits, weights->embed_tokens, buf->x_norm,
+                       cfg->vocab_size, hidden_size, buf->matvec_tmp);
+
+    free(batch_buf);
+    free(weight_f32);
+    cache->current_pos = start_pos + num_tokens;
+    return 0;
+
+sequential_fallback:;
+    /* Fall through to sequential path below */
+    for (int i = 0; i < N; i++) {
+        int pos = start_pos + i;
+        int is_last = (i == N - 1);
+        gemma3_transformer_forward(logits, tokens[i], pos, weights, cache, buf, cfg, is_last,
+                                   rope_freqs_local, rope_freqs_global, thread_pool);
+    }
+    cache->current_pos = start_pos + num_tokens;
+    return 0;
+}
+#endif /* USE_BLAS */
 
 /* Prefill: process multiple tokens at once */
 int gemma3_transformer_prefill(
@@ -456,21 +781,28 @@ int gemma3_transformer_prefill(
     const gemma3_weights_t *weights,
     gemma3_kv_cache *cache,
     activation_buffers *buf,
-    const gemma3_config *cfg
+    const gemma3_config *cfg,
+    const float *rope_freqs_local,
+    const float *rope_freqs_global,
+    void *thread_pool
 ) {
-    /* For simplicity, process tokens one at a time during prefill */
-    /* A more optimized version would batch this */
+#ifdef USE_BLAS
+    /* Use batched prefill with sgemm when BLAS is available */
+    if (num_tokens > 1) {
+        return gemma3_transformer_prefill_batched(
+            logits, tokens, num_tokens, start_pos,
+            weights, cache, buf, cfg,
+            rope_freqs_local, rope_freqs_global, thread_pool);
+    }
+#endif
+    /* Sequential fallback for single tokens or non-BLAS builds */
     for (int i = 0; i < num_tokens; i++) {
         int pos = start_pos + i;
         int is_last = (i == num_tokens - 1);
 
-        /* Only compute full logits for last token */
-        if (is_last) {
-            gemma3_transformer_forward(logits, tokens[i], pos, weights, cache, buf, cfg);
-        } else {
-            /* Compute forward but don't need logits (use temp buffer) */
-            gemma3_transformer_forward(buf->logits, tokens[i], pos, weights, cache, buf, cfg);
-        }
+        /* Only compute logits for last token — skips ~40% of work for others */
+        gemma3_transformer_forward(logits, tokens[i], pos, weights, cache, buf, cfg, is_last,
+                                   rope_freqs_local, rope_freqs_global, thread_pool);
     }
 
     cache->current_pos = start_pos + num_tokens;
@@ -486,6 +818,11 @@ typedef struct gemma3_transformer {
     gemma3_kv_cache *cache;
     activation_buffers *buffers;
     gemma3_config config;
+    float *rope_freqs_local;   /* [max_context, head_dim/2, 2] cos/sin for theta=10000 */
+    float *rope_freqs_global;  /* [max_context, head_dim/2, 2] cos/sin for theta=1000000 */
+#ifdef USE_THREADS
+    gemma3_thread_pool *thread_pool;
+#endif
 } gemma3_transformer;
 
 gemma3_transformer *gemma3_transformer_create(
@@ -512,13 +849,37 @@ gemma3_transformer *gemma3_transformer_create(
         return NULL;
     }
 
+    /* Precompute RoPE cos/sin tables for local and global theta */
+    int rope_table_size = max_context * (cfg->head_dim / 2) * 2;
+    t->rope_freqs_local = (float *)malloc(rope_table_size * sizeof(float));
+    t->rope_freqs_global = (float *)malloc(rope_table_size * sizeof(float));
+    if (!t->rope_freqs_local || !t->rope_freqs_global) {
+        free(t->rope_freqs_local);
+        free(t->rope_freqs_global);
+        free_buffers(t->buffers);
+        gemma3_kv_cache_free(t->cache);
+        free(t);
+        return NULL;
+    }
+    gemma3_rope_precompute(t->rope_freqs_local, max_context, cfg->head_dim, cfg->rope_theta_local);
+    gemma3_rope_precompute(t->rope_freqs_global, max_context, cfg->head_dim, cfg->rope_theta_global);
+
+#ifdef USE_THREADS
+    t->thread_pool = gemma3_thread_pool_create(0); /* 0 = auto-detect CPU count */
+#endif
+
     return t;
 }
 
 void gemma3_transformer_destroy(gemma3_transformer *t) {
     if (!t) return;
+#ifdef USE_THREADS
+    gemma3_thread_pool_destroy(t->thread_pool);
+#endif
     gemma3_kv_cache_free(t->cache);
     free_buffers(t->buffers);
+    free(t->rope_freqs_local);
+    free(t->rope_freqs_global);
     free(t);
 }
 
@@ -528,9 +889,14 @@ int gemma3_transformer_forward_token(
     int pos,
     float *logits
 ) {
+    void *pool = NULL;
+#ifdef USE_THREADS
+    pool = t->thread_pool;
+#endif
     return gemma3_transformer_forward(
         logits, token_id, pos,
-        t->weights, t->cache, t->buffers, &t->config
+        t->weights, t->cache, t->buffers, &t->config, 1,
+        t->rope_freqs_local, t->rope_freqs_global, pool
     );
 }
 
@@ -541,9 +907,14 @@ int gemma3_transformer_prefill_tokens(
     int start_pos,
     float *logits
 ) {
+    void *pool = NULL;
+#ifdef USE_THREADS
+    pool = t->thread_pool;
+#endif
     return gemma3_transformer_prefill(
         logits, tokens, num_tokens, start_pos,
-        t->weights, t->cache, t->buffers, &t->config
+        t->weights, t->cache, t->buffers, &t->config,
+        t->rope_freqs_local, t->rope_freqs_global, pool
     );
 }
 
