@@ -72,21 +72,6 @@ static void signal_handler(int sig) {
  * Streaming Callback
  * ========================================================================== */
 
-/* Buffer to detect control tokens being generated character-by-character */
-static char g_pending_buf[64];
-static int g_pending_len = 0;
-
-static void flush_pending(void) {
-    for (int i = 0; i < g_pending_len; i++) {
-        putchar(g_pending_buf[i]);
-    }
-    g_pending_len = 0;
-}
-
-static void reset_pending(void) {
-    g_pending_len = 0;
-}
-
 static int stream_callback(int token_id, const char *token_str, void *user_data) {
     (void)user_data;
 
@@ -99,16 +84,19 @@ static int stream_callback(int token_id, const char *token_str, void *user_data)
         return 0;
     }
 
-    /* Skip control tokens by string pattern */
+    /* Skip control tokens by exact string match */
     if (token_str && token_str[0] != '\0') {
-        /* Skip any <...> control tokens like <end_of_turn>, <start_of_turn>, <bos>, etc. */
-        size_t len = strlen(token_str);
-        if (len >= 3 && token_str[0] == '<' && token_str[len-1] == '>') {
+        if (strcmp(token_str, "<end_of_turn>") == 0 ||
+            strcmp(token_str, "<start_of_turn>") == 0 ||
+            strcmp(token_str, "<bos>") == 0 ||
+            strcmp(token_str, "<eos>") == 0 ||
+            strcmp(token_str, "<pad>") == 0 ||
+            strcmp(token_str, "<unk>") == 0) {
             return 0;
         }
     }
 
-    /* Handle token output with control sequence detection */
+    /* Handle token output */
     if (token_str && token_str[0] != '\0') {
         const char *ptr = token_str;
         while (*ptr) {
@@ -116,57 +104,17 @@ static int stream_callback(int token_id, const char *token_str, void *user_data)
             if ((unsigned char)ptr[0] == 0xE2 &&
                 (unsigned char)ptr[1] == 0x96 &&
                 (unsigned char)ptr[2] == 0x81) {
-                /* If we have pending content and see a space, flush it */
-                if (g_pending_len > 0 && g_pending_buf[0] != '<') {
-                    flush_pending();
-                }
-                if (g_pending_len == 0) {
-                    putchar(' ');
-                } else {
-                    /* Space inside a potential control sequence - keep buffering */
-                    if (g_pending_len < (int)sizeof(g_pending_buf) - 1) {
-                        g_pending_buf[g_pending_len++] = ' ';
-                    }
-                }
+                putchar(' ');
                 ptr += 3;
-            } else if (ptr[0] == '<' && ptr[1] == '0' && ptr[2] == 'x') {
-                /* Byte token - skip */
-                while (*ptr && *ptr != '>') ptr++;
-                if (*ptr == '>') ptr++;
-            } else if (ptr[0] == '<') {
-                /* Start of potential control sequence */
-                flush_pending();  /* Flush any previous pending content */
-                g_pending_buf[g_pending_len++] = '<';
-                ptr++;
-            } else if (g_pending_len > 0 && g_pending_buf[0] == '<') {
-                /* We're inside a potential control sequence */
-                if (ptr[0] == '>') {
-                    /* End of control sequence - check if it's a known control token */
-                    g_pending_buf[g_pending_len++] = '>';
-                    g_pending_buf[g_pending_len] = '\0';
-
-                    /* Check if this is a control token to suppress */
-                    if (strstr(g_pending_buf, "end_of_turn") ||
-                        strstr(g_pending_buf, "start_of_turn") ||
-                        strstr(g_pending_buf, "bos") ||
-                        strstr(g_pending_buf, "eos") ||
-                        strstr(g_pending_buf, "pad")) {
-                        /* Suppress this control token and signal to stop */
-                        reset_pending();
-                        fflush(stdout);
-                        return 1;  /* Stop generation */
-                    } else {
-                        /* Not a known control token, print it */
-                        flush_pending();
-                    }
-                    ptr++;
-                } else {
-                    /* Continue buffering the control sequence */
-                    if (g_pending_len < (int)sizeof(g_pending_buf) - 2) {
-                        g_pending_buf[g_pending_len++] = *ptr;
-                    }
-                    ptr++;
+            } else if (ptr[0] == '<' && ptr[1] == '0' && ptr[2] == 'x' &&
+                       ptr[3] != '\0' && ptr[4] != '\0' && ptr[5] == '>') {
+                /* Byte token <0xNN> - decode and print the actual byte */
+                unsigned int byte_val;
+                if (sscanf(ptr, "<0x%02X>", &byte_val) == 1 ||
+                    sscanf(ptr, "<0x%02x>", &byte_val) == 1) {
+                    putchar((char)byte_val);
                 }
+                ptr += 6;
             } else {
                 /* Regular character - print directly */
                 putchar(*ptr);
@@ -560,7 +508,6 @@ static int run_single_prompt(gemma3_ctx *ctx, const cli_config *config) {
     };
 
     g_interrupted = 0;
-    reset_pending();  /* Reset control sequence buffer */
 
     /* Use chat interface to properly format prompt with chat template */
     gemma3_message messages[2];
@@ -690,7 +637,6 @@ static int run_interactive(gemma3_ctx *ctx, const cli_config *config) {
         };
 
         g_interrupted = 0;
-        reset_pending();  /* Reset control sequence buffer */
         printf("\nGemma: ");
         fflush(stdout);
 

@@ -560,6 +560,7 @@ char *gemma3_detokenize(gemma3_tokenizer *tok, const int *tokens, int num_tokens
             if (piece) {
                 /* Handle ▁ -> space conversion */
                 const char *src = piece;
+                size_t piece_len = strlen(piece);
                 while (*src) {
                     /* Check for ▁ (0xE2 0x96 0x81) */
                     if ((uint8_t)src[0] == 0xE2 &&
@@ -568,9 +569,10 @@ char *gemma3_detokenize(gemma3_tokenizer *tok, const int *tokens, int num_tokens
                         *ptr++ = ' ';
                         src += 3;
                     }
-                    /* Check for byte token <0xNN> */
-                    else if (src[0] == '<' && src[1] == '0' && src[2] == 'x' &&
-                             src[5] == '>' && src[6] == '\0') {
+                    /* Check for byte token <0xNN> - must be exactly 6 chars */
+                    else if (piece_len == 6 &&
+                             src[0] == '<' && src[1] == '0' && src[2] == 'x' &&
+                             src[5] == '>') {
                         unsigned int byte_val;
                         if (sscanf(src, "<0x%02X>", &byte_val) == 1 ||
                             sscanf(src, "<0x%02x>", &byte_val) == 1) {
