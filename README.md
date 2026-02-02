@@ -1,7 +1,6 @@
 # gemma3.c
 
 `gemma3.c` is a **from‑scratch CPU inference engine** for the *Gemma 3 4B IT* model.
-It proves that modern LLMs can run without Python, PyTorch, or GPUs.
 
 ## ✨ Highlights
 
@@ -13,6 +12,8 @@ It proves that modern LLMs can run without Python, PyTorch, or GPUs.
 * 💬 **Interactive chat mode**
 * 📦 **CLI + Library API**
 * 🐧 **Linux/macOS native**, 🪟 Windows via **WSL** (recommended) or **MinGW**
+* 🔗 **OpenBLAS support** (optional) – BLAS-accelerated matrix operations
+* 🧵 **Multi-threaded inference** – Thread pool for parallel computation
 
 ---
 
@@ -43,6 +44,11 @@ make
 ./gemma3 -m ./gemma-3-4b-it -i
 ```
 
+> **OpenBLAS builds:** `make blas` and `make blas-threads` require OpenBLAS:
+> - Linux: `sudo apt install libopenblas-dev`
+> - macOS: `brew install openblas`
+> - Windows (MSYS2): `pacman -S mingw-w64-x86_64-openblas`
+
 ---
 
 ## 📥 Model Download
@@ -65,10 +71,14 @@ Manual alternatives: `huggingface-cli` or `git lfs`.
 ## 🛠️ Build Targets
 
 ```bash
-make        # Optimized
-make debug  # Debug symbols
-make fast   # -march=native -ffast-math
-make clean
+make              # Release build (default)
+make debug        # Debug symbols
+make fast         # Native optimizations (-march=native -ffast-math)
+make threads      # Thread pool parallelization
+make blas         # OpenBLAS acceleration (requires libopenblas)
+make blas-threads # OpenBLAS + threads (best performance)
+make clean        # Remove build artifacts
+make help         # Show all targets
 ```
 
 ---
@@ -137,10 +147,12 @@ Reduce usage:
 * Prefill: ~2–5 tok/s
 * Generation: ~1–3 tok/s
 
-Use:
+For better performance:
 
 ```bash
-make fast
+make fast          # Single-threaded with native optimizations
+make threads       # Multi-core parallelization
+make blas-threads  # Best performance (requires OpenBLAS)
 ```
 
 ---
