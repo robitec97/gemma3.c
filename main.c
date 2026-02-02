@@ -3,7 +3,7 @@
  *
  * Usage:
  *   ./gemma3 -m <model_dir> -p "Your prompt here"
- *   ./gemma3 -m <model_dir> -i -s "System prompt"
+ *   ./gemma3 -m <model_dir> -p "Your prompt" -s "System prompt"
  */
 
 #include "gemma3.h"
@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <unistd.h>
 
 /* ============================================================================
  * Configuration
@@ -21,7 +20,6 @@ typedef struct {
     const char *model_dir;
     const char *prompt;
     const char *system_prompt;
-    int interactive;
     int max_tokens;
     float temperature;
     int top_k;
@@ -41,7 +39,6 @@ static cli_config default_cli_config(void) {
         .model_dir = NULL,
         .prompt = NULL,
         .system_prompt = "You are a helpful assistant.",
-        .interactive = 0,
         .max_tokens = 512,
         .temperature = 0.7f,
         .top_k = 50,
@@ -137,9 +134,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -m, --model <path>      Path to model directory (required)\n");
-    fprintf(stderr, "  -p, --prompt <text>     Input prompt for generation\n");
-    fprintf(stderr, "  -i, --interactive       Interactive chat mode\n");
-    fprintf(stderr, "  -s, --system <text>     System prompt for chat mode\n");
+    fprintf(stderr, "  -p, --prompt <text>     Input prompt for generation (required)\n");
+    fprintf(stderr, "  -s, --system <text>     System prompt (default: \"You are a helpful assistant.\")\n");
     fprintf(stderr, "  -n, --max-tokens <n>    Maximum tokens to generate (default: 512)\n");
     fprintf(stderr, "  -t, --temperature <f>   Sampling temperature (default: 0.7)\n");
     fprintf(stderr, "  -k, --top-k <n>         Top-k sampling (default: 50, 0=disabled)\n");
@@ -158,8 +154,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Hello, how are you?\"\n", prog);
-    fprintf(stderr, "  %s -m ./gemma-3-4b-it -i\n", prog);
-    fprintf(stderr, "  %s -m ./gemma-3-4b-it -i -s \"You are a pirate.\"\n", prog);
+    fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Write a poem\" -s \"You are a poet.\"\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Say OK\" --greedy --verbose-tokens\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it --tokenize -p \"Hello, world!\"\n", prog);
 }
@@ -186,8 +181,6 @@ static int parse_args(int argc, char **argv, cli_config *config) {
                 return 0;
             }
             config->prompt = argv[i];
-        } else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--interactive") == 0) {
-            config->interactive = 1;
         } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--system") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Error: -s requires an argument\n");
@@ -256,17 +249,8 @@ static int parse_args(int argc, char **argv, cli_config *config) {
         return 0;
     }
 
-    /* Special modes only require prompt */
-    if (config->tokenize_mode || config->detokenize_mode || config->logits_mode) {
-        if (!config->prompt) {
-            fprintf(stderr, "Error: -p (prompt) is required for debug modes\n");
-            return 0;
-        }
-        return 1;
-    }
-
-    if (!config->interactive && !config->prompt) {
-        fprintf(stderr, "Error: Either -p (prompt) or -i (interactive) is required\n");
+    if (!config->prompt) {
+        fprintf(stderr, "Error: Prompt (-p) is required\n");
         return 0;
     }
 
@@ -539,136 +523,6 @@ static int run_single_prompt(gemma3_ctx *ctx, const cli_config *config) {
 }
 
 /* ============================================================================
- * Interactive Chat Mode
- * ========================================================================== */
-
-#define MAX_INPUT_LEN 4096
-#define MAX_MESSAGES 100
-
-static int run_interactive(gemma3_ctx *ctx, const cli_config *config) {
-    printf("Gemma 3 Interactive Chat\n");
-    printf("Type 'quit' or 'exit' to end, 'clear' to reset conversation\n");
-    printf("System: %s\n", config->system_prompt);
-    printf("---\n\n");
-
-    gemma3_message messages[MAX_MESSAGES];
-    int num_messages = 0;
-
-    /* Add system message */
-    if (config->system_prompt && strlen(config->system_prompt) > 0) {
-        messages[num_messages].role = GEMMA3_ROLE_SYSTEM;
-        messages[num_messages].content = config->system_prompt;
-        num_messages++;
-    }
-
-    char input[MAX_INPUT_LEN];
-
-    while (1) {
-        /* Prompt */
-        printf("You: ");
-        fflush(stdout);
-
-        /* Read input */
-        if (!fgets(input, sizeof(input), stdin)) {
-            printf("\n");
-            break;
-        }
-
-        /* Remove trailing newline */
-        int len = strlen(input);
-        if (len > 0 && input[len - 1] == '\n') {
-            input[len - 1] = '\0';
-            len--;
-        }
-
-        /* Skip empty input */
-        if (len == 0) continue;
-
-        /* Check for commands */
-        if (strcmp(input, "quit") == 0 || strcmp(input, "exit") == 0) {
-            printf("Goodbye!\n");
-            break;
-        }
-
-        if (strcmp(input, "clear") == 0) {
-            num_messages = 0;
-            if (config->system_prompt && strlen(config->system_prompt) > 0) {
-                messages[num_messages].role = GEMMA3_ROLE_SYSTEM;
-                messages[num_messages].content = config->system_prompt;
-                num_messages++;
-            }
-            gemma3_reset_cache(ctx);
-            printf("[Conversation cleared]\n\n");
-            continue;
-        }
-
-        /* Check message limit */
-        if (num_messages >= MAX_MESSAGES - 1) {
-            printf("[Warning: Maximum messages reached, clearing history]\n");
-            num_messages = 0;
-            if (config->system_prompt && strlen(config->system_prompt) > 0) {
-                messages[num_messages].role = GEMMA3_ROLE_SYSTEM;
-                messages[num_messages].content = config->system_prompt;
-                num_messages++;
-            }
-            gemma3_reset_cache(ctx);
-        }
-
-        /* Add user message */
-        char *user_input = strdup(input);
-        if (!user_input) {
-            fprintf(stderr, "Error: Out of memory\n");
-            break;
-        }
-        messages[num_messages].role = GEMMA3_ROLE_USER;
-        messages[num_messages].content = user_input;
-        num_messages++;
-
-        /* Generate response */
-        gemma3_gen_params params = {
-            .max_tokens = config->max_tokens,
-            .temperature = config->temperature,
-            .top_k = config->top_k,
-            .top_p = config->top_p,
-            .seed = config->seed,
-            .stop_on_eos = 1,
-            .greedy = config->greedy,
-            .verbose_tokens = config->verbose_tokens,
-        };
-
-        g_interrupted = 0;
-        printf("\nGemma: ");
-        fflush(stdout);
-
-        char *response = gemma3_chat(ctx, messages, num_messages, &params,
-                                     stream_callback, NULL);
-        printf("\n\n");
-
-        if (!response) {
-            fprintf(stderr, "[Error: Generation failed: %s]\n\n", gemma3_get_error());
-            /* Remove the failed user message */
-            free((char *)messages[num_messages - 1].content);
-            num_messages--;
-            continue;
-        }
-
-        /* Add assistant response to history */
-        messages[num_messages].role = GEMMA3_ROLE_MODEL;
-        messages[num_messages].content = response;
-        num_messages++;
-    }
-
-    /* Cleanup message history */
-    for (int i = 0; i < num_messages; i++) {
-        if (messages[i].role != GEMMA3_ROLE_SYSTEM) {
-            free((char *)messages[i].content);
-        }
-    }
-
-    return 0;
-}
-
-/* ============================================================================
  * Main
  * ========================================================================== */
 
@@ -709,8 +563,6 @@ int main(int argc, char **argv) {
         result = run_detokenize_mode(ctx, &config);
     } else if (config.logits_mode) {
         result = run_logits_mode(ctx, &config);
-    } else if (config.interactive) {
-        result = run_interactive(ctx, &config);
     } else {
         result = run_single_prompt(ctx, &config);
     }
