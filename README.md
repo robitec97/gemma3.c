@@ -40,8 +40,6 @@ make
 # Single prompt
 ./gemma3 -m ./gemma-3-4b-it -p "Explain quantum computing simply."
 
-# Interactive chat
-./gemma3 -m ./gemma-3-4b-it -i
 ```
 
 > **OpenBLAS builds:** `make blas` and `make blas-threads` require OpenBLAS:
