@@ -47,7 +47,6 @@ make
 > **OpenBLAS builds:** `make blas` and `make blas-threads` require OpenBLAS:
 > - Linux: `sudo apt install libopenblas-dev`
 > - macOS: `brew install openblas`
-> - Windows (MSYS2): `pacman -S mingw-w64-x86_64-openblas`
 
 ---
 
