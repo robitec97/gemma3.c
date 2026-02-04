@@ -21,7 +21,7 @@
 
 > ⚠️ POSIX‑first: native on Linux/macOS. On Windows use **WSL** or **MinGW** (no `mmap`).
 
-### 1️⃣ Download model (recommended)
+### 1️⃣ Download model
 
 ```bash
 export HF_TOKEN=your_token_here
