@@ -14,6 +14,21 @@
 #ifdef USE_THREADS
 #include "gemma3_threads.h"
 #endif
+#ifdef USE_MPS
+/* From gemma3_metal.m */
+typedef struct gemma3_metal_context gemma3_metal_context;
+gemma3_metal_context *gemma3_metal_init(const gemma3_config *cfg, int max_context);
+void gemma3_metal_free(gemma3_metal_context *ctx);
+int gemma3_metal_upload_weights(gemma3_metal_context *ctx, const void *weights);
+int gemma3_metal_upload_rope(gemma3_metal_context *ctx,
+                              const float *rope_local, const float *rope_global,
+                              int max_context, int head_dim);
+int gemma3_metal_forward_token(gemma3_metal_context *ctx, int token_id, int pos,
+                                float *logits, int compute_logits);
+int gemma3_metal_prefill(gemma3_metal_context *ctx, const int *tokens, int num_tokens,
+                          int start_pos, float *logits);
+void gemma3_metal_reset_cache(gemma3_metal_context *ctx);
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -823,6 +838,9 @@ typedef struct gemma3_transformer {
 #ifdef USE_THREADS
     gemma3_thread_pool *thread_pool;
 #endif
+#ifdef USE_MPS
+    gemma3_metal_context *metal_ctx;
+#endif
 } gemma3_transformer;
 
 gemma3_transformer *gemma3_transformer_create(
@@ -868,11 +886,32 @@ gemma3_transformer *gemma3_transformer_create(
     t->thread_pool = gemma3_thread_pool_create(0); /* 0 = auto-detect CPU count */
 #endif
 
+#ifdef USE_MPS
+    t->metal_ctx = gemma3_metal_init(cfg, max_context);
+    if (t->metal_ctx) {
+        if (gemma3_metal_upload_weights(t->metal_ctx, t->weights) != 0 ||
+            gemma3_metal_upload_rope(t->metal_ctx, t->rope_freqs_local,
+                                     t->rope_freqs_global, max_context,
+                                     cfg->head_dim) != 0) {
+            fprintf(stderr, "Metal: weight/rope upload failed, falling back to CPU\n");
+            gemma3_metal_free(t->metal_ctx);
+            t->metal_ctx = NULL;
+        } else {
+            fprintf(stderr, "Metal GPU acceleration enabled\n");
+        }
+    } else {
+        fprintf(stderr, "Metal GPU not available, using CPU\n");
+    }
+#endif
+
     return t;
 }
 
 void gemma3_transformer_destroy(gemma3_transformer *t) {
     if (!t) return;
+#ifdef USE_MPS
+    if (t->metal_ctx) gemma3_metal_free(t->metal_ctx);
+#endif
 #ifdef USE_THREADS
     gemma3_thread_pool_destroy(t->thread_pool);
 #endif
@@ -889,6 +928,11 @@ int gemma3_transformer_forward_token(
     int pos,
     float *logits
 ) {
+#ifdef USE_MPS
+    if (t->metal_ctx) {
+        return gemma3_metal_forward_token(t->metal_ctx, token_id, pos, logits, 1);
+    }
+#endif
     void *pool = NULL;
 #ifdef USE_THREADS
     pool = t->thread_pool;
@@ -907,6 +951,11 @@ int gemma3_transformer_prefill_tokens(
     int start_pos,
     float *logits
 ) {
+#ifdef USE_MPS
+    if (t->metal_ctx) {
+        return gemma3_metal_prefill(t->metal_ctx, tokens, num_tokens, start_pos, logits);
+    }
+#endif
     void *pool = NULL;
 #ifdef USE_THREADS
     pool = t->thread_pool;
@@ -922,6 +971,11 @@ void gemma3_transformer_reset(gemma3_transformer *t) {
     if (t && t->cache) {
         gemma3_kv_cache_reset(t->cache);
     }
+#ifdef USE_MPS
+    if (t && t->metal_ctx) {
+        gemma3_metal_reset_cache(t->metal_ctx);
+    }
+#endif
 }
 
 int gemma3_transformer_get_pos(gemma3_transformer *t) {

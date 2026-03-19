@@ -7,6 +7,8 @@
 #   make blas           - Build with OpenBLAS
 #   make threads        - Build with thread pool
 #   make blas-threads   - Build with OpenBLAS + thread pool
+#   make mps            - Build with Metal GPU acceleration (macOS)
+#   make mps-threads    - Build with Metal GPU + thread pool fallback
 #   make clean          - Remove all build artifacts
 
 # --- Configuration ---
@@ -40,6 +42,7 @@ MODE ?= release
 CFLAGS = $(CFLAGS_BASE)
 LDFLAGS = $(LDFLAGS_BASE)
 SRCS = $(SRCS_BASE)
+SRCS_M =
 
 # Apply Mode-Specific configurations
 # This runs only when the recursive make is called with MODE set
@@ -69,14 +72,23 @@ ifneq (,$(findstring threads,$(MODE)))
     SRCS += gemma3_threads.c
 endif
 
+# Check for MPS (Metal) in the mode string
+ifneq (,$(findstring mps,$(MODE)))
+    CFLAGS += $(CFLAGS_FAST) -DUSE_MPS
+    LDFLAGS += -framework Metal -framework Foundation
+    SRCS_M += gemma3_metal.m
+endif
+
 # Calculate Objects based on the current MODE
-# Result: build/blas-threads/gemma3.o, etc.
-OBJS = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS))
+# Split into C and Objective-C objects for different compilation rules
+OBJS_C = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS))
+OBJS_M = $(patsubst %.m, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS_M))
+OBJS = $(OBJS_C) $(OBJS_M)
 
 # --- Convenience Targets ---
 # These targets just re-run make with a specific MODE
 
-.PHONY: all debug fast blas threads blas-threads clean help
+.PHONY: all debug fast blas threads blas-threads mps mps-threads clean help
 
 all:
 	@$(MAKE) --no-print-directory build_core MODE=release
@@ -96,6 +108,12 @@ threads:
 blas-threads:
 	@$(MAKE) --no-print-directory build_core MODE=blas-threads
 
+mps:
+	@$(MAKE) --no-print-directory build_core MODE=mps CC=clang
+
+mps-threads:
+	@$(MAKE) --no-print-directory build_core MODE=mps-threads CC=clang
+
 # --- The Real Build Target ---
 
 # This target does the actual work. 
@@ -112,6 +130,10 @@ $(BUILD_DIR)/$(MODE)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/$(MODE)/%.o: %.m
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
+
 # Include dependencies
 -include $(wildcard $(BUILD_DIR)/*/*.d)
 
@@ -126,3 +148,5 @@ help:
 	@echo "  make blas         : OpenBLAS"
 	@echo "  make threads      : Thread pool"
 	@echo "  make blas-threads : OpenBLAS + Threads"
+	@echo "  make mps          : Metal GPU (macOS Apple Silicon)"
+	@echo "  make mps-threads  : Metal GPU + Thread pool fallback"
