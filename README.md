@@ -1,27 +1,28 @@
 # gemma3.c
 
-`gemma3.c` is a **from‑scratch CPU inference engine** for the *Gemma 3 4B IT* model.
+`gemma3.c` is a **from-scratch inference engine** for the *Gemma 3 4B IT* model, written in pure C.
 
-## ✨ Highlights
+## Highlights
 
-* ⚙️ **100% Pure C (C11)** – zero external dependencies
-* 🧠 **Full Gemma 3 architecture** – GQA, hybrid attention, SwiGLU
-* 🗺️ **Memory‑mapped weights** – BF16 SafeTensors via `mmap`
-* 🔤 **Native SentencePiece tokenizer** – 262K vocab
-* 🌊 **Streaming output** – token‑by‑token callbacks
-* 💬 **Interactive chat mode**
-* 📦 **CLI + Library API**
-* 🐧 **Linux/macOS native**, 🪟 Windows via **WSL** (recommended) or **MinGW**
-* 🔗 **OpenBLAS support** (optional) – BLAS-accelerated matrix operations
-* 🧵 **Multi-threaded inference** – Thread pool for parallel computation
+* **100% Pure C (C11)** - zero external dependencies
+* **Full Gemma 3 architecture** - GQA, hybrid attention, SwiGLU
+* **Metal GPU acceleration** - Apple Silicon via Metal Performance Shaders
+* **Memory-mapped weights** - BF16 SafeTensors via `mmap`
+* **Native SentencePiece tokenizer** - 262K vocab
+* **Streaming output** - token-by-token callbacks
+* **Interactive chat mode** - multi-turn conversations
+* **CLI + Library API**
+* **Multi-threaded inference** - thread pool for parallel computation
+* **OpenBLAS support** (optional) - BLAS-accelerated matrix operations
+* **Linux/macOS native**, Windows via **WSL** (recommended) or **MinGW**
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-> ⚠️ POSIX‑first: native on Linux/macOS. On Windows use **WSL** or **MinGW** (no `mmap`).
+> POSIX-first: native on Linux/macOS. On Windows use **WSL** or **MinGW** (no `mmap`).
 
-### 1️⃣ Download model
+### 1. Download model
 
 ```bash
 export HF_TOKEN=your_token_here
@@ -29,18 +30,22 @@ pip install huggingface_hub
 python download_model.py
 ```
 
-### 2️⃣ Build
+### 2. Build
 
 ```bash
-make
+make              # CPU release build
+make mps          # Metal GPU (macOS Apple Silicon)
+make blas-threads # OpenBLAS + threads (best CPU performance)
 ```
 
-### 3️⃣ Run
+### 3. Run
 
 ```bash
 # Single prompt
 ./gemma3 -m ./gemma-3-4b-it -p "Explain quantum computing simply."
 
+# Interactive chat
+./gemma3 -m ./gemma-3-4b-it -i
 ```
 
 > **OpenBLAS builds:** `make blas` and `make blas-threads` require OpenBLAS:
@@ -49,24 +54,7 @@ make
 
 ---
 
-## 📥 Model Download
-
-The included Python script:
-
-* Handles HuggingFace auth
-* Downloads all shards
-* Resumes broken downloads
-* Verifies integrity
-
-```bash
-python download_model.py --token YOUR_HF_TOKEN
-```
-
-Manual alternatives: `huggingface-cli` or `git lfs`.
-
----
-
-## 🛠️ Build Targets
+## Build Targets
 
 ```bash
 make              # Release build (default)
@@ -74,32 +62,96 @@ make debug        # Debug symbols
 make fast         # Native optimizations (-march=native -ffast-math)
 make threads      # Thread pool parallelization
 make blas         # OpenBLAS acceleration (requires libopenblas)
-make blas-threads # OpenBLAS + threads (best performance)
+make blas-threads # OpenBLAS + threads (best CPU performance)
+make mps          # Metal GPU acceleration (macOS Apple Silicon)
+make mps-threads  # Metal GPU + thread pool fallback
 make clean        # Remove build artifacts
 make help         # Show all targets
 ```
 
 ---
 
-## 🧪 CLI Options
+## CLI Options
+
+### Basic
 
 ```
--m <path>    Model directory
--p <text>    Prompt
--i           Interactive mode
--s <text>    System prompt
--n <n>       Max tokens
--t <f>       Temperature
--k <n>       Top‑k
---top-p <f>  Top‑p
--c <n>       Context size
---seed <n>   RNG seed
--v           Verbose
+-m, --model <path>      Model directory (required)
+-p, --prompt <text>     Input prompt
+-i, --interactive       Interactive chat mode
+-s, --system <text>     System prompt (default: "You are a helpful assistant.")
+-c, --context <n>       Context size (default: 8192)
+-v, --verbose           Verbose output
+-h, --help              Show help
+```
+
+### Generation
+
+```
+-n, --max-tokens <n>    Max tokens to generate (default: 512)
+-t, --temperature <f>   Sampling temperature (default: 0.7)
+-k, --top-k <n>         Top-k sampling (default: 50, 0=disabled)
+--top-p <f>             Top-p sampling (default: 0.9)
+--seed <n>              Random seed (-1 for random)
+--greedy                Force greedy decoding (deterministic)
+```
+
+### Debug / Utility
+
+```
+--verbose-tokens        Print token IDs during generation (to stderr)
+--tokenize              Tokenize prompt and print token IDs
+--detokenize            Detokenize comma-separated IDs from prompt
+--logits                Run single forward pass and show top-20 logits
+```
+
+### Examples
+
+```bash
+# Standard generation
+./gemma3 -m ./gemma-3-4b-it -p "Hello, how are you?"
+
+# Custom system prompt
+./gemma3 -m ./gemma-3-4b-it -p "Write a poem" -s "You are a poet."
+
+# Greedy decoding with token IDs
+./gemma3 -m ./gemma-3-4b-it -p "Say OK" --greedy --verbose-tokens
+
+# Interactive chat
+./gemma3 -m ./gemma-3-4b-it -i
+./gemma3 -m ./gemma-3-4b-it -i -s "You are a pirate."
+
+# Tokenize a string
+./gemma3 -m ./gemma-3-4b-it --tokenize -p "Hello, world!"
+
+# Inspect logits
+./gemma3 -m ./gemma-3-4b-it --logits -p "The capital of France is"
 ```
 
 ---
 
-## 📚 Library Example
+## Interactive Mode
+
+Start with `-i`:
+
+```bash
+./gemma3 -m ./gemma-3-4b-it -i -s "You are a helpful assistant."
+```
+
+**Commands:**
+
+| Command        | Action                      |
+| -------------- | --------------------------- |
+| `quit` / `exit`| End the session             |
+| `clear`        | Reset conversation history  |
+| Ctrl+C         | Cancel current generation   |
+| Ctrl+D         | Exit (EOF)                  |
+
+Conversations are multi-turn - the model sees the full chat history. Use `clear` to start fresh without restarting.
+
+---
+
+## Library Example
 
 ```c
 gemma3_ctx *ctx = gemma3_load_dir("./gemma-3-4b-it");
@@ -114,25 +166,29 @@ gemma3_free(ctx);
 
 ---
 
-## 🧠 Model Specs
+## Model Specs
 
-| Param   | Value              |
-| ------- | ------------------ |
-| Vocab   | 262,208            |
-| Layers  | 34                 |
-| Hidden  | 2,560              |
-| Heads   | 8 (4 KV, GQA)      |
-| Context | 128K               |
-| Pattern | 5 local : 1 global |
+| Param          | Value              |
+| -------------- | ------------------ |
+| Vocab          | 262,208            |
+| Layers         | 34                 |
+| Hidden dim     | 2,560              |
+| Intermediate   | 10,240             |
+| Heads          | 8 (4 KV, GQA)     |
+| Head dim       | 256                |
+| Context        | 128K               |
+| Attention      | 5 local : 1 global |
+| Sliding window | 1,024              |
+| RoPE theta     | 10K local / 1M global |
 
 ---
 
-## 💾 Memory
+## Memory
 
-* Weights: ~8 GB on disk (BF16)
-* Runtime RAM: **~3 GB total**
+* Weights: ~8 GB on disk (BF16)
+* Runtime RAM: **~3 GB total**
 
-Reduce usage:
+The KV cache scales with context size. Reduce memory with a smaller context:
 
 ```bash
 ./gemma3 -m ./gemma-3-4b-it -c 512 -p "Hello"
@@ -140,33 +196,43 @@ Reduce usage:
 
 ---
 
-## ⚡ Performance (CPU)
+## Performance
 
-* Prefill: ~2–5 tok/s
-* Generation: ~1–3 tok/s
+### CPU
 
-For better performance:
+* Prefill: ~2-5 tok/s
+* Generation: ~1-3 tok/s
+
+For better CPU performance:
 
 ```bash
-make fast          # Single-threaded with native optimizations
+make fast          # Native optimizations (single-threaded)
 make threads       # Multi-core parallelization
-make blas-threads  # Best performance (requires OpenBLAS)
+make blas-threads  # Best CPU performance (requires OpenBLAS)
+```
+
+### GPU (Metal)
+
+On macOS with Apple Silicon, use the Metal backend for GPU-accelerated matrix operations:
+
+```bash
+make mps           # Metal GPU
+make mps-threads   # Metal GPU + thread pool fallback
 ```
 
 ---
 
-## ⚠️ Limitations
+## Limitations
 
-* CPU only
-* Text only
-* No quantization (yet)
+* Text only (no vision)
+* No quantization (BF16 only)
 
 ---
 
-## 🪪 License
+## License
 
 MIT License.
-Model weights under Google’s Gemma license.
+Model weights under Google's Gemma license.
 
 ---
 
