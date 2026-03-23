@@ -196,13 +196,6 @@ The KV cache scales with context size. Reduce memory with a smaller context:
 
 ---
 
-## Performance
-
-### CPU
-
-* Prefill: ~2-5 tok/s
-* Generation: ~1-3 tok/s
-
 For better CPU performance:
 
 ```bash
