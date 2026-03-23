@@ -233,7 +233,3 @@ make mps-threads   # Metal GPU + thread pool fallback
 
 MIT License.
 Model weights under Google's Gemma license.
-
----
-
-*If you ever wanted to see Gemma 3 breathe in pure C, this is it.*
