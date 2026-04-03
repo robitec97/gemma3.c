@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/stat.h>
 
 /* ============================================================================
  * Configuration
@@ -37,7 +38,7 @@ typedef struct {
 
 static cli_config default_cli_config(void) {
     return (cli_config){
-        .model_dir = NULL,
+        .model_dir = "gemma-3-4b-it",
         .prompt = NULL,
         .system_prompt = "You are a helpful assistant.",
         .interactive = 0,
@@ -135,7 +136,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Version: %s\n\n", gemma3_version());
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -m, --model <path>      Path to model directory (required)\n");
+    fprintf(stderr, "  -m, --model <path>      Path to model directory (default: gemma-3-4b-it)\n");
     fprintf(stderr, "  -p, --prompt <text>     Input prompt for generation\n");
     fprintf(stderr, "  -i, --interactive       Interactive chat mode\n");
     fprintf(stderr, "  -s, --system <text>     System prompt (default: \"You are a helpful assistant.\")\n");
@@ -156,6 +157,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --logits                Run single forward pass and show top-20 logits\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  %s -p \"Hello, how are you?\"\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Hello, how are you?\"\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Write a poem\" -s \"You are a poet.\"\n", prog);
     fprintf(stderr, "  %s -m ./gemma-3-4b-it -p \"Say OK\" --greedy --verbose-tokens\n", prog);
@@ -251,9 +253,13 @@ static int parse_args(int argc, char **argv, cli_config *config) {
         }
     }
 
-    if (!config->model_dir) {
-        fprintf(stderr, "Error: Model directory (-m) is required\n");
-        return 0;
+    {
+        struct stat st;
+        if (stat(config->model_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Error: Model directory '%s' not found\n", config->model_dir);
+            fprintf(stderr, "  Run 'python download_model.py' to download the model, or specify -m <path>\n");
+            return 0;
+        }
     }
 
     int debug_mode = config->tokenize_mode || config->detokenize_mode || config->logits_mode;

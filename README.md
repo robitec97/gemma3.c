@@ -41,11 +41,14 @@ make blas-threads # OpenBLAS + threads (best CPU performance)
 ### 3. Run
 
 ```bash
-# Single prompt
-./gemma3 -m ./gemma-3-4b-it -p "Explain quantum computing simply."
+# Single prompt (uses ./gemma-3-4b-it by default)
+./gemma3 -p "Explain quantum computing simply."
 
 # Interactive chat
-./gemma3 -m ./gemma-3-4b-it -i
+./gemma3 -i
+
+# Custom model path
+./gemma3 -m /path/to/model -p "Hello"
 ```
 
 > **OpenBLAS builds:** `make blas` and `make blas-threads` require OpenBLAS:
@@ -76,7 +79,7 @@ make help         # Show all targets
 ### Basic
 
 ```
--m, --model <path>      Model directory (required)
+-m, --model <path>      Model directory (default: ./gemma-3-4b-it)
 -p, --prompt <text>     Input prompt
 -i, --interactive       Interactive chat mode
 -s, --system <text>     System prompt (default: "You are a helpful assistant.")
@@ -108,24 +111,27 @@ make help         # Show all targets
 ### Examples
 
 ```bash
-# Standard generation
-./gemma3 -m ./gemma-3-4b-it -p "Hello, how are you?"
+# Standard generation (default model directory)
+./gemma3 -p "Hello, how are you?"
+
+# Custom model path
+./gemma3 -m /path/to/model -p "Hello, how are you?"
 
 # Custom system prompt
-./gemma3 -m ./gemma-3-4b-it -p "Write a poem" -s "You are a poet."
+./gemma3 -p "Write a poem" -s "You are a poet."
 
 # Greedy decoding with token IDs
-./gemma3 -m ./gemma-3-4b-it -p "Say OK" --greedy --verbose-tokens
+./gemma3 -p "Say OK" --greedy --verbose-tokens
 
 # Interactive chat
-./gemma3 -m ./gemma-3-4b-it -i
-./gemma3 -m ./gemma-3-4b-it -i -s "You are a pirate."
+./gemma3 -i
+./gemma3 -i -s "You are a pirate."
 
 # Tokenize a string
-./gemma3 -m ./gemma-3-4b-it --tokenize -p "Hello, world!"
+./gemma3 --tokenize -p "Hello, world!"
 
 # Inspect logits
-./gemma3 -m ./gemma-3-4b-it --logits -p "The capital of France is"
+./gemma3 --logits -p "The capital of France is"
 ```
 
 ---
@@ -135,7 +141,7 @@ make help         # Show all targets
 Start with `-i`:
 
 ```bash
-./gemma3 -m ./gemma-3-4b-it -i -s "You are a helpful assistant."
+./gemma3 -i -s "You are a helpful assistant."
 ```
 
 **Commands:**
@@ -191,7 +197,7 @@ gemma3_free(ctx);
 The KV cache scales with context size. Reduce memory with a smaller context:
 
 ```bash
-./gemma3 -m ./gemma-3-4b-it -c 512 -p "Hello"
+./gemma3 -c 512 -p "Hello"
 ```
 
 ---
