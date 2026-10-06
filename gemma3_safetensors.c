@@ -529,7 +529,7 @@ void st_free(st_context *ctx) {
 }
 
 /* Find tensor by name */
-st_tensor_info *st_find_tensor(st_context *ctx, const char *name) {
+static st_tensor_info *st_find_tensor(st_context *ctx, const char *name) {
     for (int i = 0; i < ctx->num_tensors; i++) {
         if (strcmp(ctx->tensors[i].name, name) == 0) {
             return &ctx->tensors[i];
@@ -539,96 +539,20 @@ st_tensor_info *st_find_tensor(st_context *ctx, const char *name) {
 }
 
 /* Get raw pointer to tensor data (still in file format, e.g., BF16) */
-void *st_get_tensor_data(st_context *ctx, st_tensor_info *info) {
+static void *st_get_tensor_data(st_context *ctx, st_tensor_info *info) {
     if (!ctx || !info || info->file_idx < 0 || info->file_idx >= ctx->num_files) {
         return NULL;
     }
     return ctx->files[info->file_idx].data_start + info->data_offset;
 }
 
-/* Get tensor as F32 (converting if necessary) */
-float *st_get_tensor_f32(st_context *ctx, st_tensor_info *info) {
-    void *raw = st_get_tensor_data(ctx, info);
-    if (!raw) return NULL;
-
-    // Calculate number of elements
-    int64_t num_elements = 1;
-    for (int i = 0; i < info->ndims; i++) {
-        num_elements *= info->shape[i];
-    }
-
-    // Allocate output buffer
-    float *out = (float *)malloc(num_elements * sizeof(float));
-    if (!out) return NULL;
-
-    // Convert based on dtype
-    switch (info->dtype) {
-        case ST_DTYPE_F32:
-            memcpy(out, raw, num_elements * sizeof(float));
-            break;
-        case ST_DTYPE_BF16:
-            gemma3_bf16_to_f32(out, (const uint16_t *)raw, num_elements);
-            break;
-        case ST_DTYPE_F16:
-            // F16 conversion (simple expansion, not full precision)
-            for (int64_t i = 0; i < num_elements; i++) {
-                uint16_t h = ((const uint16_t *)raw)[i];
-                // Extract F16 components
-                uint32_t sign = (h >> 15) & 1;
-                uint32_t exp = (h >> 10) & 0x1F;
-                uint32_t mant = h & 0x3FF;
-
-                uint32_t f32;
-                if (exp == 0) {
-                    if (mant == 0) {
-                        f32 = sign << 31;  // Zero
-                    } else {
-                        // Denormal - normalize
-                        while ((mant & 0x400) == 0) {
-                            mant <<= 1;
-                            exp--;
-                        }
-                        exp++;
-                        mant &= 0x3FF;
-                        f32 = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-                    }
-                } else if (exp == 31) {
-                    f32 = (sign << 31) | 0x7F800000 | (mant << 13);  // Inf/NaN
-                } else {
-                    f32 = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
-                }
-                memcpy(&out[i], &f32, sizeof(float));
-            }
-            break;
-        default:
-            free(out);
-            return NULL;
-    }
-
-    return out;
-}
-
 /* Get tensor element count */
-int64_t st_tensor_numel(st_tensor_info *info) {
+static int64_t st_tensor_numel(st_tensor_info *info) {
     int64_t n = 1;
     for (int i = 0; i < info->ndims; i++) {
         n *= info->shape[i];
     }
     return n;
-}
-
-/* Print tensor info for debugging */
-void st_print_info(st_context *ctx) {
-    printf("SafeTensors: %d files, %d tensors\n", ctx->num_files, ctx->num_tensors);
-    for (int i = 0; i < ctx->num_tensors; i++) {
-        st_tensor_info *t = &ctx->tensors[i];
-        printf("  %s: dtype=%d, shape=[", t->name, t->dtype);
-        for (int j = 0; j < t->ndims; j++) {
-            printf("%ld%s", (long)t->shape[j], j < t->ndims - 1 ? ", " : "");
-        }
-        printf("], file=%d, offset=%ld, size=%ld\n",
-               t->file_idx, (long)t->data_offset, (long)t->data_size);
-    }
 }
 
 /* ============================================================================

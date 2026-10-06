@@ -166,7 +166,13 @@ test-model:
 	@$(MAKE) --no-print-directory build_core
 	@$(MAKE) --no-print-directory gemma3-test-tokenizer
 	./gemma3-test-tokenizer $(MODEL)/tokenizer.model tests
+	@$(MAKE) --no-print-directory gemma3-test-cache
+	./gemma3-test-cache $(MODEL)
 	./tests/test_e2e.sh ./$(TARGET) $(MODEL)
+
+gemma3-test-cache: tests/test_cache.c $(OBJS_LIB)
+	@echo "Linking gemma3-test-cache [$(MODE)]"
+	@$(CC) $(CFLAGS) tests/test_cache.c $(OBJS_LIB) -o $@ $(LDFLAGS)
 
 gemma3-test-tokenizer: tests/test_tokenizer.c $(OBJS_LIB)
 	@echo "Linking gemma3-test-tokenizer [$(MODE)]"
@@ -183,7 +189,7 @@ bench-kernels:
 	./gemma3-bench-kernels
 
 clean:
-	rm -rf $(TARGET) $(BUILD_DIR) gemma3-test gemma3-test-tokenizer gemma3-bench gemma3-bench-kernels gemma3-example
+	rm -rf $(TARGET) $(BUILD_DIR) gemma3-test gemma3-test-tokenizer gemma3-bench gemma3-bench-kernels gemma3-example gemma3-test-cache
 
 help:
 	@echo "Build targets:"
