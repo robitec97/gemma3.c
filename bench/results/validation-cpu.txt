@@ -1,0 +1,7 @@
+prompt                                       vs              top20  max|diff|  mean|diff|  argmax
+-------------------------------------------------------------------------------------------------
+The capital of France is (6 tok)             reference       20/20     0.0001      0.0000     yes
+def fibonacci(n):\n    if n < 2... (22 tok)  reference       20/20     0.0001      0.0000     yes
+Water boils at a temperature of (7 tok)      reference       20/20     0.0001      0.0000     yes
+Section 1. The history of compu... (1490 tok) reference       20/20     0.0001      0.0000     yes
+PASS (thresholds: top20 overlap >= 18, max|diff| <= 0.25, argmax match)

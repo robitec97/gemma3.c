@@ -12,6 +12,7 @@
 #   make test-model     - Run model-dependent tests (MODEL=path, default ./gemma-3-4b-it)
 #   make bench          - Build the end-to-end benchmark (./gemma3-bench)
 #   make bench-kernels  - Build and run kernel micro-benchmarks (no model needed)
+#   make example        - Build the library API example (./gemma3-example)
 #   make clean          - Remove all build artifacts
 #
 # Set EXTRA_CFLAGS=-DGEMMA3_NO_SIMD to build the plain C kernels only.
@@ -91,7 +92,7 @@ OBJ_MAIN = $(BUILD_DIR)/$(MODE)/main.o
 # --- Convenience Targets ---
 
 .PHONY: all native portable debug asan blas mps fast threads blas-threads mps-threads \
-        build_core test test-kernels test-model bench bench-kernels clean help
+        build_core test test-kernels test-model bench bench-kernels example clean help
 
 all: native
 
@@ -149,6 +150,10 @@ gemma3-bench: bench/bench_e2e.c $(OBJS_LIB)
 	@echo "Linking gemma3-bench [$(MODE)]"
 	@$(CC) $(CFLAGS) bench/bench_e2e.c $(OBJS_LIB) -o $@ $(LDFLAGS)
 
+gemma3-example: examples/simple.c $(OBJS_LIB)
+	@echo "Linking gemma3-example [$(MODE)]"
+	@$(CC) $(CFLAGS) examples/simple.c $(OBJS_LIB) -o $@ $(LDFLAGS)
+
 gemma3-bench-kernels: bench/bench_kernels.c $(OBJS_LIB)
 	@echo "Linking gemma3-bench-kernels [$(MODE)]"
 	@$(CC) $(CFLAGS) bench/bench_kernels.c $(OBJS_LIB) -o $@ $(LDFLAGS)
@@ -170,12 +175,15 @@ gemma3-test-tokenizer: tests/test_tokenizer.c $(OBJS_LIB)
 bench:
 	@$(MAKE) --no-print-directory gemma3-bench
 
+example:
+	@$(MAKE) --no-print-directory gemma3-example
+
 bench-kernels:
 	@$(MAKE) --no-print-directory gemma3-bench-kernels
 	./gemma3-bench-kernels
 
 clean:
-	rm -rf $(TARGET) $(BUILD_DIR) gemma3-test gemma3-test-tokenizer gemma3-bench gemma3-bench-kernels
+	rm -rf $(TARGET) $(BUILD_DIR) gemma3-test gemma3-test-tokenizer gemma3-bench gemma3-bench-kernels gemma3-example
 
 help:
 	@echo "Build targets:"
@@ -191,5 +199,6 @@ help:
 	@echo "  make test-model    Tokenizer golden tests + end-to-end checks (needs model)"
 	@echo "  make bench         Build ./gemma3-bench (end-to-end tokens/s, needs model)"
 	@echo "  make bench-kernels Kernel micro-benchmarks (GB/s, GFLOP/s; no model)"
+	@echo "  make example       Build ./gemma3-example (library API demo)"
 	@echo ""
 	@echo "Variables: MODE=native|portable|debug|asan|blas|mps  MODEL=<dir>  CC=<compiler>"

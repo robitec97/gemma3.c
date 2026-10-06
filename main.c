@@ -381,6 +381,21 @@ static gemma3_gen_params make_params(const cli_config *config) {
  * Debug Modes
  * ========================================================================== */
 
+/* Token piece made printable for tables: control characters are escaped */
+static const char *printable_piece(const char *piece, char *buf, size_t size) {
+    if (!piece) return "(null)";
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)piece; *p && o + 5 < size; p++) {
+        if (*p == '\n') { buf[o++] = '\\'; buf[o++] = 'n'; }
+        else if (*p == '\t') { buf[o++] = '\\'; buf[o++] = 't'; }
+        else if (*p == '\r') { buf[o++] = '\\'; buf[o++] = 'r'; }
+        else if (*p < 0x20) { o += (size_t)snprintf(buf + o, size - o, "\\x%02x", *p); }
+        else buf[o++] = (char)*p;
+    }
+    buf[o] = '\0';
+    return buf;
+}
+
 static int run_tokenize_mode(gemma3_ctx *ctx, const cli_config *config) {
     gemma3_tokenizer *tok = gemma3_get_tokenizer(ctx);
     int max_tokens = (int)strlen(config->prompt) + 8;
@@ -400,8 +415,9 @@ static int run_tokenize_mode(gemma3_ctx *ctx, const cli_config *config) {
     for (int i = 0; i < n_tokens; i++) printf("%s%d", i ? ", " : "", tokens[i]);
     printf("]\n\nToken breakdown:\n");
     for (int i = 0; i < n_tokens; i++) {
-        const char *piece = gemma3_decode_token(tok, tokens[i]);
-        printf("  %4d: %6d -> '%s'\n", i, tokens[i], piece ? piece : "(null)");
+        char pbuf[512];
+        printf("  %4d: %6d -> '%s'\n", i, tokens[i],
+               printable_piece(gemma3_decode_token(tok, tokens[i]), pbuf, sizeof(pbuf)));
     }
     free(tokens);
     return 0;
@@ -498,9 +514,9 @@ static int run_logits_mode(gemma3_ctx *ctx, const cli_config *config) {
     printf("%-6s  %-10s  %-10s  %s\n", "Rank", "Token ID", "Logit", "Token");
     printf("------  ----------  ----------  --------\n");
     for (int i = 0; i < 20 && top[i].id >= 0; i++) {
-        const char *piece = gemma3_decode_token(tok, top[i].id);
+        char pbuf[512];
         printf("%-6d  %-10d  %10.4f  '%s'\n", i + 1, top[i].id, top[i].logit,
-               piece ? piece : "(null)");
+               printable_piece(gemma3_decode_token(tok, top[i].id), pbuf, sizeof(pbuf)));
     }
 
     free(tokens);

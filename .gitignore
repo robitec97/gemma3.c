@@ -6,6 +6,8 @@ build/
 gemma3
 gemma3-bench
 gemma3-bench-kernels
+gemma3-example
+gemma3-test-tokenizer
 gemma3-test
 *.o
 *.d
