@@ -19,6 +19,15 @@
 #ifdef USE_MPS
 #include "gemma3_metal.h"
 #endif
+#ifdef USE_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+/* Below this many tokens the native kernels beat convert-then-sgemm */
+#define GEMMA3_BLAS_MIN_TOKENS 32
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +156,7 @@ struct gemma3_transformer {
     float *rope_freqs_local;   /* [max_context, head_dim/2, 2] cos/sin, theta=10K */
     float *rope_freqs_global;  /* [max_context, head_dim/2, 2] cos/sin, theta=1M, scaled */
     gemma3_thread_pool *pool;
+    float *blas_scratch;       /* F32 copy of one weight matrix (BLAS builds) */
     const volatile int *abort_flag;
 #ifdef USE_MPS
     gemma3_metal_context *metal_ctx;
@@ -194,7 +204,34 @@ static void multi_proj_fn(void *arg, int start, int end) {
     }
 }
 
-static void run_projections(gemma3_thread_pool *pool, multi_proj_task *t) {
+#ifdef USE_BLAS
+typedef struct {
+    float *dst;
+    const uint16_t *src;
+} cvt_task;
+
+static void cvt_fn(void *arg, int start, int end) {
+    cvt_task *c = (cvt_task *)arg;
+    gemma3_bf16_to_f32(c->dst + start, c->src + start, end - start);
+}
+#endif
+
+static void run_projections(gemma3_thread_pool *pool, multi_proj_task *t,
+                            float *blas_scratch) {
+#ifdef USE_BLAS
+    if (blas_scratch && t->N >= GEMMA3_BLAS_MIN_TOKENS) {
+        for (int i = 0; i < t->count; i++) {
+            cvt_task c = { blas_scratch, t->W[i] };
+            gemma3_parallel_for(pool, t->M[i] * t->K, 1 << 16, cvt_fn, &c);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        t->N, t->M[i], t->K, 1.0f, t->X, t->K,
+                        blas_scratch, t->K, 0.0f, t->Y[i], t->M[i]);
+        }
+        return;
+    }
+#else
+    (void)blas_scratch;
+#endif
     int total = 0;
     for (int i = 0; i < t->count; i++) total += t->M[i];
     int nt = gemma3_thread_pool_size(pool);
@@ -208,9 +245,9 @@ static void run_projections(gemma3_thread_pool *pool, multi_proj_task *t) {
 }
 
 static void project(gemma3_thread_pool *pool, float *Y, const float *X, int N,
-                    const uint16_t *W, int M, int K) {
+                    const uint16_t *W, int M, int K, float *blas_scratch) {
     multi_proj_task t = { 1, { W, NULL, NULL }, { Y, NULL, NULL }, { M, 0, 0 }, K, X, N };
-    run_projections(pool, &t);
+    run_projections(pool, &t, blas_scratch);
 }
 
 /* Per-token RMSNorm over rows of a [N, n] matrix (optionally adding the
@@ -337,7 +374,7 @@ static void forward_chunk(gemma3_transformer *t, const int *tokens, int N,
             { q_size, kv_size, kv_size },
             hs, b->xn, N
         };
-        run_projections(pool, &qkv);
+        run_projections(pool, &qkv, t->blas_scratch);
 
         /* QK-norm, RoPE, and append K/V to the cache for every token */
         for (int i = 0; i < N; i++) {
@@ -377,7 +414,7 @@ static void forward_chunk(gemma3_transformer *t, const int *tokens, int N,
             attn_worker(&at, 0, 1);
         }
 
-        project(pool, b->proj, b->attn, N, w->layers[l].o_proj, hs, q_size);
+        project(pool, b->proj, b->attn, N, w->layers[l].o_proj, hs, q_size, t->blas_scratch);
 
         /* x += post_attention_norm(proj) */
         rows_norm(pool, b->proj, b->proj, b->x, w->layers[l].post_attention_layernorm, N, hs, eps);
@@ -392,12 +429,12 @@ static void forward_chunk(gemma3_transformer *t, const int *tokens, int N,
             { is, is, 0 },
             hs, b->xn, N
         };
-        run_projections(pool, &gu);
+        run_projections(pool, &gu, t->blas_scratch);
 
         gelu_task gt = { b->gate, b->up };
         gemma3_parallel_for(N > 1 ? pool : NULL, N * is, 4096, gelu_fn, &gt);
 
-        project(pool, b->proj, b->gate, N, w->layers[l].down_proj, hs, is);
+        project(pool, b->proj, b->gate, N, w->layers[l].down_proj, hs, is, t->blas_scratch);
 
         /* x += post_feedforward_norm(mlp_out) */
         rows_norm(pool, b->proj, b->proj, b->x, w->layers[l].post_feedforward_layernorm, N, hs, eps);
@@ -436,6 +473,17 @@ gemma3_transformer *gemma3_transformer_create(
     size_t rope_table_size = (size_t)max_context * (cfg->head_dim / 2) * 2;
     t->rope_freqs_local = (float *)malloc(rope_table_size * sizeof(float));
     t->rope_freqs_global = (float *)malloc(rope_table_size * sizeof(float));
+
+#ifdef USE_BLAS
+    size_t max_w = (size_t)cfg->intermediate_size * cfg->hidden_size;
+    size_t qw = (size_t)cfg->num_heads * cfg->head_dim * cfg->hidden_size;
+    if (qw > max_w) max_w = qw;
+    t->blas_scratch = (float *)malloc(max_w * sizeof(float));
+    if (!t->blas_scratch) {
+        gemma3_transformer_destroy(t);
+        return NULL;
+    }
+#endif
 
     if (!t->pool || !t->cache || !t->buffers || !t->rope_freqs_local || !t->rope_freqs_global) {
         gemma3_transformer_destroy(t);
@@ -478,6 +526,7 @@ void gemma3_transformer_destroy(gemma3_transformer *t) {
     free_buffers(t->buffers);
     free(t->rope_freqs_local);
     free(t->rope_freqs_global);
+    free(t->blas_scratch);
     free(t);
 }
 

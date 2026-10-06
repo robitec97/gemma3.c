@@ -21,8 +21,14 @@ extern "C" {
  * Shared constants
  * ========================================================================== */
 
-/* Maximum number of tokens processed together during batched prefill. */
+/* Maximum number of tokens processed together during batched prefill.
+ * BLAS builds convert each BF16 weight matrix to F32 once per chunk before
+ * calling sgemm, so they use larger chunks to amortize that conversion. */
+#ifdef USE_BLAS
+#define GEMMA3_PREFILL_CHUNK 512
+#else
 #define GEMMA3_PREFILL_CHUNK 128
+#endif
 
 /* Local (sliding-window) layers keep their KV cache in a ring buffer of
  * sliding_window + GEMMA3_LOCAL_RING_EXTRA slots. The extra slots let a whole

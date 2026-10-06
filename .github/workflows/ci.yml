@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Build (native)
+        run: make CC=${{ matrix.cc }}
+      - name: Build (portable, debug, blas)
+        run: |
+          make clean && make portable CC=${{ matrix.cc }}
+          make clean && make debug CC=${{ matrix.cc }}
+          make clean && make blas CC=${{ matrix.cc }}
+      - name: Unit tests
+        run: make clean && make test CC=${{ matrix.cc }}
+      - name: Unit tests (scalar kernels)
+        run: make clean && make test MODE=portable EXTRA_CFLAGS=-DGEMMA3_NO_SIMD CC=${{ matrix.cc }}
+      - name: Unit tests (ASan + UBSan)
+        run: make clean && make test MODE=asan CC=${{ matrix.cc }}
+      - name: Kernel benchmarks
+        run: make bench-kernels CC=${{ matrix.cc }}
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Unit tests (NEON)
+        run: make test
+      - name: Kernel benchmarks
+        run: make bench-kernels
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (CPU, Metal, Accelerate)
+        run: |
+          make
+          make clean && make mps
+          make clean && make blas
+      - name: Unit tests
+        run: make clean && make test
+      - name: Kernel benchmarks
+        run: make bench-kernels

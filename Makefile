@@ -13,6 +13,8 @@
 #   make bench          - Build the end-to-end benchmark (./gemma3-bench)
 #   make bench-kernels  - Build and run kernel micro-benchmarks (no model needed)
 #   make clean          - Remove all build artifacts
+#
+# Set EXTRA_CFLAGS=-DGEMMA3_NO_SIMD to build the plain C kernels only.
 
 # --- Configuration ---
 
@@ -50,6 +52,9 @@ CFLAGS = $(CFLAGS_BASE)
 LDFLAGS = $(LDFLAGS_BASE)
 SRCS = $(LIB_SRCS)
 SRCS_M =
+
+# Extra user flags, e.g. EXTRA_CFLAGS=-DGEMMA3_NO_SIMD to test the scalar kernels
+CFLAGS += $(EXTRA_CFLAGS)
 
 ifeq ($(MODE),native)
     CFLAGS += -O3 -DNDEBUG $(NATIVE_FLAGS)

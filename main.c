@@ -659,8 +659,8 @@ static int run_interactive(gemma3_ctx *ctx, cli_config *config) {
         first = 1;
     }
 
-    printf("%sChat with Gemma 3 4B%s %s(%s, context %d) - /help for commands, Ctrl+D to exit%s\n",
-           BOLD, RESET, DIM, gemma3_backend_name(ctx), gemma3_get_config(ctx)->max_context, RESET);
+    printf("%sChat with Gemma 3 4B%s %s- /help for commands, Ctrl+C stops a reply, Ctrl+D exits%s\n",
+           BOLD, RESET, DIM, RESET);
     if (first) printf("%ssystem: %s%s\n", DIM, config->system_prompt, RESET);
     printf("\n");
 

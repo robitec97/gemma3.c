@@ -18,7 +18,9 @@
 #include <string.h>
 #include <float.h>
 
-#if defined(__aarch64__) && defined(__ARM_NEON)
+#if defined(GEMMA3_NO_SIMD)
+/* plain C kernels only (used to test the scalar fallback) */
+#elif defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define G3_NEON 1
 #elif defined(__AVX2__) && defined(__FMA__)
