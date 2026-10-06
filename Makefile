@@ -34,7 +34,7 @@ LIB_SRCS = gemma3.c \
            gemma3_tokenizer.c \
            gemma3_transformer.c
 
-CFLAGS_BASE = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE
+CFLAGS_BASE = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP -I. -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE
 LDFLAGS_BASE = -lm -lpthread
 
 # Native SIMD: -mcpu=native on arm64 (NEON is always on), -march=native on x86-64
