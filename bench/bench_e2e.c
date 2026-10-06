@@ -7,13 +7,13 @@
  * Measures:
  *   - model load time
  *   - prefill throughput (prompt tokens/s) for one or more prompt lengths
- *   - decode throughput (greedy, generated tokens/s)
+ *   - decode throughput (greedy, generated tokens/s), optionally after a long context (-d)
  *   - generation throughput with the default sampler (temperature/top-k/top-p)
  *   - tokenizer throughput
  *   - peak resident memory
  *
  * Usage:
- *   ./gemma3-bench [-m model_dir] [-p 64,256,1024] [-n 128] [-r 1] [-c 4096]
+ *   ./gemma3-bench [-m model_dir] [-p 64,256,1024] [-n 128] [-d 2048] [-r 1] [-c 4096]
  *                  [--json out.json] [--label name] [--no-sample] [--no-tokenizer]
  */
 
@@ -97,6 +97,8 @@ int main(int argc, char **argv) {
     const char *label = "gemma3.c";
     int prompt_lens[16] = {64, 256, 1024};
     int n_prompts = 3;
+    int depths[16] = {0};
+    int n_depths = 0;
     int gen_tokens = 128;
     int repeats = 1;
     int context = 4096;
@@ -108,6 +110,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "-m") && i + 1 < argc) model_dir = argv[++i];
         else if (!strcmp(a, "-p") && i + 1 < argc) n_prompts = parse_list(argv[++i], prompt_lens, 16);
         else if (!strcmp(a, "-n") && i + 1 < argc) gen_tokens = atoi(argv[++i]);
+        else if (!strcmp(a, "-d") && i + 1 < argc) n_depths = parse_list(argv[++i], depths, 16);
         else if (!strcmp(a, "-r") && i + 1 < argc) repeats = atoi(argv[++i]);
         else if (!strcmp(a, "-c") && i + 1 < argc) context = atoi(argv[++i]);
         else if (!strcmp(a, "--json") && i + 1 < argc) json_path = argv[++i];
@@ -116,7 +119,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-tokenizer")) do_tokenizer = 0;
         else {
             fprintf(stderr,
-                "Usage: %s [-m model_dir] [-p 64,256,1024] [-n gen_tokens] [-r repeats]\n"
+                "Usage: %s [-m model_dir] [-p 64,256,1024] [-n gen_tokens] [-d 2048,4096] [-r repeats]\n"
                 "          [-c context] [--json out.json] [--label name]\n"
                 "          [--no-sample] [--no-tokenizer]\n", argv[0]);
             return 1;
@@ -126,6 +129,7 @@ int main(int argc, char **argv) {
 
     int max_prompt = 0;
     for (int i = 0; i < n_prompts; i++) if (prompt_lens[i] > max_prompt) max_prompt = prompt_lens[i];
+    for (int i = 0; i < n_depths; i++) if (depths[i] > max_prompt) max_prompt = depths[i];
     if (max_prompt + gen_tokens + 8 > context) context = max_prompt + gen_tokens + 8;
 
     /* ---- Load ---- */
@@ -205,6 +209,33 @@ int main(int argc, char **argv) {
     printf("%-28s %12.2f %12.2f\n", dname, gen_tokens / dec_best, 1000.0 * dec_best / gen_tokens);
     fflush(stdout);
 
+    /* ---- Decode after a long context (-d): attention cost grows with depth ---- */
+    double depth_tps[16] = {0};
+    for (int di = 0; di < n_depths; di++) {
+        int d = depths[di];
+        double best = 1e30;
+        for (int r = 0; r < repeats; r++) {
+            gemma3_reset_cache(ctx);
+            if (gemma3_forward_batch(ctx, prompt, d, 0, logits) != 0) {
+                fprintf(stderr, "prefill for depth %d failed\n", d); return 1;
+            }
+            int pos = d;
+            double s = now_sec();
+            for (int i = 0; i < gen_tokens; i++) {
+                if (gemma3_forward(ctx, argmax(logits, vocab), pos++, logits) != 0) {
+                    fprintf(stderr, "decode failed\n"); return 1;
+                }
+            }
+            double e = now_sec() - s;
+            if (e < best) best = e;
+        }
+        depth_tps[di] = gen_tokens / best;
+        char name[64];
+        snprintf(name, sizeof(name), "decode tg%d @ depth %d", gen_tokens, d);
+        printf("%-28s %12.2f %12.2f\n", name, depth_tps[di], 1000.0 * best / gen_tokens);
+        fflush(stdout);
+    }
+
     /* ---- Generation with default sampler (includes sampling cost) ---- */
     double gen_tps = 0.0, gen_s = 0.0;
     int gen_count = 0;
@@ -261,6 +292,11 @@ int main(int argc, char **argv) {
             }
             fprintf(f, "],\n  \"decode\": {\"tokens\": %d, \"seconds\": %.5f, \"tok_per_s\": %.3f},\n",
                     gen_tokens, dec_best, gen_tokens / dec_best);
+            fprintf(f, "  \"decode_at_depth\": [");
+            for (int i = 0; i < n_depths; i++) {
+                fprintf(f, "%s{\"depth\": %d, \"tok_per_s\": %.3f}", i ? ", " : "", depths[i], depth_tps[i]);
+            }
+            fprintf(f, "],\n");
             fprintf(f, "  \"generate\": {\"tokens\": %d, \"seconds\": %.5f, \"tok_per_s\": %.3f},\n",
                     gen_count, gen_s, gen_tps);
             fprintf(f, "  \"tokenizer_bytes_per_s\": %.1f,\n", tok_chars_per_s);

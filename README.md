@@ -157,6 +157,18 @@ Debugging:
       --verbose-tokens    Print each sampled token ID to stderr
 ```
 
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `GEMMA3_MODEL` | Default model directory |
+| `GEMMA3_THREADS` | Default CPU thread count |
+| `GEMMA3_NO_METAL=1` | Run a `make mps` build on the CPU (same as `--cpu`) |
+| `GEMMA3_METAL_KV=f16` | Half-precision KV cache on the GPU (half the memory; logits within ~1e-2) |
+| `GEMMA3_METAL_PROFILE=1` | Print GPU time per command buffer |
+| `GEMMA3_METAL_DEBUG=1` | Print device, KV cache and weight-mapping details |
+| `NO_COLOR` | Disable colored output |
+
 ### Interactive chat
 
 `./gemma3 -i` keeps the whole conversation in context. The KV cache is reused
