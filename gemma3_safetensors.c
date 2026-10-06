@@ -5,7 +5,7 @@
  * Supports split files (model-00001-of-00002.safetensors, etc.)
  */
 
-#include "gemma3.h"
+#include "gemma3_internal.h"
 #include "gemma3_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,13 +82,13 @@ typedef struct {
     char *data_start;
 } st_file;
 
-typedef struct {
+struct st_context {
     st_file *files;
     int num_files;
     st_tensor_info *tensors;
     int num_tensors;
     char model_dir[1024];
-} st_context;
+};
 
 /* ============================================================================
  * Simple JSON Parser (minimal, just for SafeTensors header)
@@ -358,6 +358,12 @@ static int st_open_file(st_file *f, const char *path) {
     }
     f->file_size = st.st_size;
 
+    if (f->file_size < 8) {
+        fprintf(stderr, "Error: %s is too small to be a safetensors file\n", path);
+        close(f->fd);
+        return 0;
+    }
+
     f->mmap_ptr = mmap(NULL, f->file_size, PROT_READ, MAP_PRIVATE, f->fd, 0);
     if (f->mmap_ptr == MAP_FAILED) {
         close(f->fd);
@@ -367,6 +373,13 @@ static int st_open_file(st_file *f, const char *path) {
     // Parse header size (first 8 bytes as little-endian uint64)
     uint64_t header_size;
     memcpy(&header_size, f->mmap_ptr, 8);
+    if (header_size > f->file_size - 8) {
+        fprintf(stderr, "Error: %s has a corrupt header (size %llu)\n", path,
+                (unsigned long long)header_size);
+        munmap(f->mmap_ptr, f->file_size);
+        close(f->fd);
+        return 0;
+    }
     f->header_size = header_size;
 
     // Data starts after 8-byte length + header
@@ -478,6 +491,21 @@ st_context *st_load(const char *model_dir) {
             free(ctx->tensors);
             free(ctx);
             return NULL;
+        }
+        /* Reject tensors whose data would fall outside the file */
+        size_t data_bytes = ctx->files[i].file_size - 8 - ctx->files[i].header_size;
+        for (int t = ctx->num_tensors; t < ctx->num_tensors + file_tensors; t++) {
+            st_tensor_info *ti = &ctx->tensors[t];
+            if (ti->data_offset < 0 || ti->data_size < 0 ||
+                (uint64_t)ti->data_offset + (uint64_t)ti->data_size > data_bytes) {
+                fprintf(stderr, "Error: tensor '%s' in %s points outside the file\n",
+                        ti->name, file_paths[i]);
+                for (int j = 0; j <= i; j++) st_close_file(&ctx->files[j]);
+                free(ctx->files);
+                free(ctx->tensors);
+                free(ctx);
+                return NULL;
+            }
         }
         ctx->num_tensors += file_tensors;
     }
@@ -603,110 +631,104 @@ void st_print_info(st_context *ctx) {
  * Weight Loading for Gemma 3
  * ========================================================================== */
 
-/* Gemma 3 weight structure - stores BF16 pointers directly to mmap'd data */
-typedef struct {
-    /* Embeddings */
-    const uint16_t *embed_tokens;  /* [vocab_size, hidden_size] BF16 */
 
-    /* Per-layer weights */
-    struct {
-        /* Self-attention */
-        const uint16_t *input_layernorm;    /* [hidden_size] BF16 */
-        const uint16_t *q_proj;             /* [num_heads * head_dim, hidden_size] BF16 */
-        const uint16_t *k_proj;             /* [num_kv_heads * head_dim, hidden_size] BF16 */
-        const uint16_t *v_proj;             /* [num_kv_heads * head_dim, hidden_size] BF16 */
-        const uint16_t *o_proj;             /* [hidden_size, num_heads * head_dim] BF16 */
-        const uint16_t *q_norm;             /* [head_dim] BF16 - QK normalization */
-        const uint16_t *k_norm;             /* [head_dim] BF16 - QK normalization */
-
-        /* MLP */
-        const uint16_t *post_attention_layernorm;  /* [hidden_size] BF16 */
-        const uint16_t *gate_proj;          /* [intermediate_size, hidden_size] BF16 */
-        const uint16_t *up_proj;            /* [intermediate_size, hidden_size] BF16 */
-        const uint16_t *down_proj;          /* [hidden_size, intermediate_size] BF16 */
-
-        /* Pre-feedforward layernorm (Gemma 3 specific) */
-        const uint16_t *pre_feedforward_layernorm;  /* [hidden_size] BF16 */
-        const uint16_t *post_feedforward_layernorm; /* [hidden_size] BF16 */
-    } layers[GEMMA3_NUM_LAYERS];
-
-    /* Final norm */
-    const uint16_t *norm;  /* [hidden_size] BF16 */
-} gemma3_weights_t;
-
-/* Load a single weight tensor by name - returns raw BF16 pointer */
-static const uint16_t *load_weight_bf16(st_context *st, const char *name) {
-    st_tensor_info *info = st_find_tensor(st, name);
+/* Load a single weight tensor by name - returns raw BF16 pointer into the mmap */
+static const uint16_t *load_weight_bf16(st_context *st, const char *prefix,
+                                        const char *name, int64_t expected_numel) {
+    char full[ST_MAX_NAME_LEN];
+    snprintf(full, sizeof(full), "%s%s", prefix, name);
+    st_tensor_info *info = st_find_tensor(st, full);
     if (!info) {
-        fprintf(stderr, "Warning: tensor '%s' not found\n", name);
+        fprintf(stderr, "Error: tensor '%s' not found\n", full);
         return NULL;
     }
     if (info->dtype != ST_DTYPE_BF16) {
-        fprintf(stderr, "Warning: tensor '%s' is not BF16 (dtype=%d)\n", name, info->dtype);
+        fprintf(stderr, "Error: tensor '%s' is not BF16 (dtype=%d); only BF16 checkpoints "
+                "are supported\n", full, info->dtype);
+        return NULL;
+    }
+    if (expected_numel > 0 && st_tensor_numel(info) != expected_numel) {
+        fprintf(stderr, "Error: tensor '%s' has %lld elements, expected %lld "
+                "(is this a Gemma 3 4B checkpoint?)\n", full,
+                (long long)st_tensor_numel(info), (long long)expected_numel);
+        return NULL;
     }
     return (const uint16_t *)st_get_tensor_data(st, info);
 }
 
+/* Checkpoints name the text model differently depending on how they were saved:
+ *   language_model.model.*   - Gemma3ForConditionalGeneration (HF hub, transformers < 4.50)
+ *   model.language_model.*   - Gemma3ForConditionalGeneration (transformers >= 4.50)
+ *   model.*                  - Gemma3ForCausalLM (text-only export) */
+static const char *detect_prefix(st_context *st) {
+    static const char *prefixes[] = {
+        "language_model.model.", "model.language_model.", "model.", ""
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        char name[ST_MAX_NAME_LEN];
+        snprintf(name, sizeof(name), "%sembed_tokens.weight", prefixes[i]);
+        if (st_find_tensor(st, name)) return prefixes[i];
+    }
+    return NULL;
+}
+
 /* Load all Gemma 3 weights from SafeTensors context - uses BF16 mmap'd data */
 gemma3_weights_t *gemma3_load_weights(st_context *st) {
+    const char *prefix = detect_prefix(st);
+    if (!prefix) {
+        fprintf(stderr, "Error: no 'embed_tokens.weight' tensor found - not a Gemma 3 checkpoint?\n");
+        return NULL;
+    }
+
     gemma3_weights_t *w = (gemma3_weights_t *)calloc(1, sizeof(gemma3_weights_t));
     if (!w) return NULL;
 
-    // Load embeddings (multimodal model uses language_model.model. prefix)
-    w->embed_tokens = load_weight_bf16(st, "language_model.model.embed_tokens.weight");
-    if (!w->embed_tokens) {
+    const int64_t hs = GEMMA3_HIDDEN_SIZE;
+    const int64_t is = GEMMA3_INTERMEDIATE_SIZE;
+    const int64_t hd = GEMMA3_HEAD_DIM;
+    const int64_t q_size = (int64_t)GEMMA3_NUM_HEADS * hd;
+    const int64_t kv_size = (int64_t)GEMMA3_NUM_KV_HEADS * hd;
+    int ok = 1;
+
+    w->embed_tokens = load_weight_bf16(st, prefix, "embed_tokens.weight",
+                                       (int64_t)GEMMA3_VOCAB_SIZE * hs);
+    w->norm = load_weight_bf16(st, prefix, "norm.weight", hs);
+    ok &= w->embed_tokens && w->norm;
+
+    for (int l = 0; l < GEMMA3_NUM_LAYERS && ok; l++) {
+        char name[ST_MAX_NAME_LEN];
+#define LOAD(field, suffix, numel) \
+        snprintf(name, sizeof(name), "layers.%d." suffix, l); \
+        w->layers[l].field = load_weight_bf16(st, prefix, name, numel); \
+        ok &= w->layers[l].field != NULL;
+
+        LOAD(input_layernorm,            "input_layernorm.weight",            hs)
+        LOAD(q_proj,                     "self_attn.q_proj.weight",           q_size * hs)
+        LOAD(k_proj,                     "self_attn.k_proj.weight",           kv_size * hs)
+        LOAD(v_proj,                     "self_attn.v_proj.weight",           kv_size * hs)
+        LOAD(o_proj,                     "self_attn.o_proj.weight",           hs * q_size)
+        LOAD(q_norm,                     "self_attn.q_norm.weight",           hd)
+        LOAD(k_norm,                     "self_attn.k_norm.weight",           hd)
+        LOAD(post_attention_layernorm,   "post_attention_layernorm.weight",   hs)
+        LOAD(gate_proj,                  "mlp.gate_proj.weight",              is * hs)
+        LOAD(up_proj,                    "mlp.up_proj.weight",                is * hs)
+        LOAD(down_proj,                  "mlp.down_proj.weight",              hs * is)
+        LOAD(pre_feedforward_layernorm,  "pre_feedforward_layernorm.weight",  hs)
+        LOAD(post_feedforward_layernorm, "post_feedforward_layernorm.weight", hs)
+#undef LOAD
+    }
+
+    if (!ok) {
         free(w);
         return NULL;
     }
 
-    // Load per-layer weights
-    for (int l = 0; l < GEMMA3_NUM_LAYERS; l++) {
-        char name[256];
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.input_layernorm.weight", l);
-        w->layers[l].input_layernorm = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.self_attn.q_proj.weight", l);
-        w->layers[l].q_proj = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.self_attn.k_proj.weight", l);
-        w->layers[l].k_proj = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.self_attn.v_proj.weight", l);
-        w->layers[l].v_proj = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.self_attn.o_proj.weight", l);
-        w->layers[l].o_proj = load_weight_bf16(st, name);
-
-        // QK normalization weights (Gemma 3 specific)
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.self_attn.q_norm.weight", l);
-        w->layers[l].q_norm = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.self_attn.k_norm.weight", l);
-        w->layers[l].k_norm = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.post_attention_layernorm.weight", l);
-        w->layers[l].post_attention_layernorm = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.mlp.gate_proj.weight", l);
-        w->layers[l].gate_proj = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.mlp.up_proj.weight", l);
-        w->layers[l].up_proj = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.mlp.down_proj.weight", l);
-        w->layers[l].down_proj = load_weight_bf16(st, name);
-
-        // Gemma 3 has additional layernorms
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.pre_feedforward_layernorm.weight", l);
-        w->layers[l].pre_feedforward_layernorm = load_weight_bf16(st, name);
-
-        snprintf(name, sizeof(name), "language_model.model.layers.%d.post_feedforward_layernorm.weight", l);
-        w->layers[l].post_feedforward_layernorm = load_weight_bf16(st, name);
+    /* Record the mapped files so GPU backends can wrap them without copying */
+    for (int i = 0; i < st->num_files && i < GEMMA3_MAX_MAPPED_REGIONS; i++) {
+        w->regions[i].base = st->files[i].mmap_ptr;
+        w->regions[i].size = st->files[i].file_size;
+        w->num_regions = i + 1;
     }
-
-    // Load final norm
-    w->norm = load_weight_bf16(st, "language_model.model.norm.weight");
 
     return w;
 }

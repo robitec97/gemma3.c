@@ -9,25 +9,13 @@
  * - RoPE with layer-specific theta
  */
 
-#include "gemma3.h"
+#include "gemma3_internal.h"
 #include "gemma3_kernels.h"
 #ifdef USE_THREADS
 #include "gemma3_threads.h"
 #endif
 #ifdef USE_MPS
-/* From gemma3_metal.m */
-typedef struct gemma3_metal_context gemma3_metal_context;
-gemma3_metal_context *gemma3_metal_init(const gemma3_config *cfg, int max_context);
-void gemma3_metal_free(gemma3_metal_context *ctx);
-int gemma3_metal_upload_weights(gemma3_metal_context *ctx, const void *weights);
-int gemma3_metal_upload_rope(gemma3_metal_context *ctx,
-                              const float *rope_local, const float *rope_global,
-                              int max_context, int head_dim);
-int gemma3_metal_forward_token(gemma3_metal_context *ctx, int token_id, int pos,
-                                float *logits, int compute_logits);
-int gemma3_metal_prefill(gemma3_metal_context *ctx, const int *tokens, int num_tokens,
-                          int start_pos, float *logits);
-void gemma3_metal_reset_cache(gemma3_metal_context *ctx);
+#include "gemma3_metal.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,26 +40,6 @@ static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float
  * Internal Structures (shared with gemma3.c)
  * ========================================================================== */
 
-/* Forward declarations from safetensors - BF16 weights */
-typedef struct {
-    const uint16_t *embed_tokens;
-    struct {
-        const uint16_t *input_layernorm;
-        const uint16_t *q_proj;
-        const uint16_t *k_proj;
-        const uint16_t *v_proj;
-        const uint16_t *o_proj;
-        const uint16_t *q_norm;  /* QK normalization */
-        const uint16_t *k_norm;  /* QK normalization */
-        const uint16_t *post_attention_layernorm;
-        const uint16_t *gate_proj;
-        const uint16_t *up_proj;
-        const uint16_t *down_proj;
-        const uint16_t *pre_feedforward_layernorm;
-        const uint16_t *post_feedforward_layernorm;
-    } layers[GEMMA3_NUM_LAYERS];
-    const uint16_t *norm;
-} gemma3_weights_t;
 
 /* KV Cache for a single layer */
 typedef struct {
@@ -846,7 +814,8 @@ typedef struct gemma3_transformer {
 gemma3_transformer *gemma3_transformer_create(
     gemma3_weights_t *weights,
     const gemma3_config *cfg,
-    int max_context
+    int max_context,
+    int num_threads
 ) {
     gemma3_transformer *t = (gemma3_transformer *)calloc(1, sizeof(gemma3_transformer));
     if (!t) return NULL;
@@ -879,11 +848,13 @@ gemma3_transformer *gemma3_transformer_create(
         free(t);
         return NULL;
     }
-    gemma3_rope_precompute(t->rope_freqs_local, max_context, cfg->head_dim, cfg->rope_theta_local);
-    gemma3_rope_precompute(t->rope_freqs_global, max_context, cfg->head_dim, cfg->rope_theta_global);
+    gemma3_rope_precompute(t->rope_freqs_local, max_context, cfg->head_dim,
+                           cfg->rope_theta_local, 1.0f);
+    gemma3_rope_precompute(t->rope_freqs_global, max_context, cfg->head_dim,
+                           cfg->rope_theta_global, cfg->rope_scale_global);
 
 #ifdef USE_THREADS
-    t->thread_pool = gemma3_thread_pool_create(0); /* 0 = auto-detect CPU count */
+    t->thread_pool = gemma3_thread_pool_create(num_threads); /* <= 0: auto-detect */
 #endif
 
 #ifdef USE_MPS
@@ -980,4 +951,20 @@ void gemma3_transformer_reset(gemma3_transformer *t) {
 
 int gemma3_transformer_get_pos(gemma3_transformer *t) {
     return t && t->cache ? t->cache->current_pos : 0;
+}
+
+const char *gemma3_transformer_backend(const gemma3_transformer *t) {
+#ifdef USE_MPS
+    if (t && t->metal_ctx) return "metal";
+#endif
+    (void)t;
+    return "cpu";
+}
+
+int gemma3_transformer_num_threads(const gemma3_transformer *t) {
+#ifdef USE_THREADS
+    if (t && t->thread_pool) return gemma3_thread_pool_size(t->thread_pool);
+#endif
+    (void)t;
+    return 1;
 }

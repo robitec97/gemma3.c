@@ -10,34 +10,11 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "gemma3_metal.h"
+#include "gemma3_internal.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
-
-/* ============================================================================
- * Weights type (must match gemma3_transformer.c definition)
- * ========================================================================== */
-
-typedef struct {
-    const uint16_t *embed_tokens;
-    struct {
-        const uint16_t *input_layernorm;
-        const uint16_t *q_proj;
-        const uint16_t *k_proj;
-        const uint16_t *v_proj;
-        const uint16_t *o_proj;
-        const uint16_t *q_norm;
-        const uint16_t *k_norm;
-        const uint16_t *post_attention_layernorm;
-        const uint16_t *gate_proj;
-        const uint16_t *up_proj;
-        const uint16_t *down_proj;
-        const uint16_t *pre_feedforward_layernorm;
-        const uint16_t *post_feedforward_layernorm;
-    } layers[GEMMA3_NUM_LAYERS];
-    const uint16_t *norm;
-} gemma3_weights_t;
 
 /* ============================================================================
  * GPU parameter structs (must match MSL definitions exactly)

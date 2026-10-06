@@ -5,7 +5,7 @@
  * Implements the public API defined in gemma3.h
  */
 
-#include "gemma3.h"
+#include "gemma3_internal.h"
 #include "gemma3_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,38 +41,6 @@ const char *gemma3_get_error(void) {
 }
 
 /* ============================================================================
- * Forward Declarations (from other translation units)
- * ========================================================================== */
-
-/* From gemma3_safetensors.c */
-typedef struct st_context st_context;
-st_context *st_load(const char *model_dir);
-void st_free(st_context *ctx);
-void st_print_info(st_context *ctx);
-
-/* gemma3_weights_t is defined in gemma3_safetensors.c */
-typedef struct gemma3_weights_t gemma3_weights_t;
-gemma3_weights_t *gemma3_load_weights(st_context *st);
-void gemma3_free_weights(gemma3_weights_t *w);
-
-/* From gemma3_tokenizer.c */
-gemma3_tokenizer *gemma3_tokenizer_load(const char *path);
-void gemma3_tokenizer_free(gemma3_tokenizer *tok);
-
-/* From gemma3_transformer.c */
-typedef struct gemma3_transformer gemma3_transformer;
-gemma3_transformer *gemma3_transformer_create(gemma3_weights_t *weights,
-                                               const gemma3_config *cfg,
-                                               int max_context);
-void gemma3_transformer_destroy(gemma3_transformer *t);
-int gemma3_transformer_forward_token(gemma3_transformer *t, int token_id,
-                                      int pos, float *logits);
-int gemma3_transformer_prefill_tokens(gemma3_transformer *t, const int *tokens,
-                                       int num_tokens, int start_pos, float *logits);
-void gemma3_transformer_reset(gemma3_transformer *t);
-int gemma3_transformer_get_pos(gemma3_transformer *t);
-
-/* ============================================================================
  * Context Structure
  * ========================================================================== */
 
@@ -105,7 +73,38 @@ static gemma3_config default_config(void) {
         .rmsnorm_eps = GEMMA3_RMSNORM_EPS,
         .rope_theta_local = GEMMA3_ROPE_THETA_LOCAL,
         .rope_theta_global = GEMMA3_ROPE_THETA_GLOBAL,
+        .rope_scale_global = GEMMA3_ROPE_SCALE_GLOBAL,
     };
+}
+
+/* Read the few config.json values that matter at runtime. The file is optional;
+ * missing keys keep the Gemma 3 4B defaults. */
+static void read_config_json(const char *model_dir, gemma3_config *cfg) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    /* "rope_scaling": {"factor": 8.0, "rope_type": "linear"}  (or null) */
+    const char *rs = strstr(buf, "\"rope_scaling\"");
+    if (rs) {
+        const char *colon = strchr(rs, ':');
+        while (colon && (*++colon == ' ' || *colon == '\t' || *colon == '\n' || *colon == '\r')) {}
+        if (colon && strncmp(colon, "null", 4) == 0) {
+            cfg->rope_scale_global = 1.0f;
+        } else if (colon && *colon == '{') {
+            const char *close = strchr(colon, '}');
+            const char *fac = strstr(colon, "\"factor\"");
+            if (fac && close && fac < close && (fac = strchr(fac, ':'))) {
+                float v = strtof(fac + 1, NULL);
+                if (v > 0.0f) cfg->rope_scale_global = v;
+            }
+        }
+    }
 }
 
 gemma3_gen_params gemma3_default_params(void) {
@@ -138,6 +137,7 @@ gemma3_ctx *gemma3_load_dir_ex(const char *model_dir, int max_context) {
     }
 
     ctx->config = default_config();
+    read_config_json(model_dir, &ctx->config);
     ctx->max_context = max_context > 0 ? max_context : GEMMA3_DEFAULT_CONTEXT;
     ctx->config.max_context = ctx->max_context;
 
@@ -176,7 +176,7 @@ gemma3_ctx *gemma3_load_dir_ex(const char *model_dir, int max_context) {
 
     /* Create transformer */
     fprintf(stderr, "Initializing transformer (max context: %d)...\n", ctx->max_context);
-    ctx->transformer = gemma3_transformer_create(ctx->weights, &ctx->config, ctx->max_context);
+    ctx->transformer = gemma3_transformer_create(ctx->weights, &ctx->config, ctx->max_context, 0);
     if (!ctx->transformer) {
         set_error("Failed to create transformer");
         gemma3_tokenizer_free(ctx->tokenizer);

@@ -452,17 +452,21 @@ void gemma3_rope(float *q, float *k, int n_heads, int n_kv_heads,
     }
 }
 
-void gemma3_rope_precompute(float *freqs, int max_pos, int head_dim, float theta) {
+void gemma3_rope_precompute(float *freqs, int max_pos, int head_dim, float theta,
+                            float scaling) {
     // Precompute cos/sin values for all positions
     // freqs: [max_pos, head_dim/2, 2] where last dim is (cos, sin)
+    // scaling: linear RoPE scaling (positions are divided by this factor)
     int half_dim = head_dim / 2;
+    if (scaling <= 0.0f) scaling = 1.0f;
 
-    for (int pos = 0; pos < max_pos; pos++) {
-        for (int i = 0; i < half_dim; i++) {
-            float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
-            float angle = (float)pos * freq;
-            freqs[(pos * half_dim + i) * 2] = cosf(angle);
-            freqs[(pos * half_dim + i) * 2 + 1] = sinf(angle);
+    for (int i = 0; i < half_dim; i++) {
+        double inv_freq = 1.0 / pow((double)theta, (double)(2 * i) / (double)head_dim);
+        inv_freq /= (double)scaling;
+        for (int pos = 0; pos < max_pos; pos++) {
+            double angle = (double)pos * inv_freq;
+            freqs[((size_t)pos * half_dim + i) * 2] = (float)cos(angle);
+            freqs[((size_t)pos * half_dim + i) * 2 + 1] = (float)sin(angle);
         }
     }
 }

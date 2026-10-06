@@ -46,6 +46,7 @@ extern "C" {
 #define GEMMA3_RMSNORM_EPS      1e-6f
 #define GEMMA3_ROPE_THETA_LOCAL  10000.0f
 #define GEMMA3_ROPE_THETA_GLOBAL 1000000.0f
+#define GEMMA3_ROPE_SCALE_GLOBAL 8.0f   /* linear RoPE scaling on global layers */
 
 /* Default context size for memory allocation */
 #define GEMMA3_DEFAULT_CONTEXT  8192
@@ -92,6 +93,7 @@ typedef struct {
     float rmsnorm_eps;
     float rope_theta_local;
     float rope_theta_global;
+    float rope_scale_global;  /* linear RoPE scaling factor for global layers */
 } gemma3_config;
 
 /* ============================================================================

@@ -1,1 +1,17 @@
+# Model weights
 gemma-3-4b-it/
+
+# Build outputs
+build/
+gemma3
+gemma3-bench
+gemma3-bench-kernels
+gemma3-test
+*.o
+*.d
+*.dSYM/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

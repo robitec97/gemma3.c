@@ -149,8 +149,10 @@ void gemma3_rope_single(float *x, int head_dim, int pos, float theta);
 /**
  * Precompute RoPE frequencies for given positions
  * freqs: output [max_pos, head_dim/2, 2] (cos, sin pairs)
+ * scaling: linear position scaling factor (1.0 = none, 8.0 for Gemma 3 4B global layers)
  */
-void gemma3_rope_precompute(float *freqs, int max_pos, int head_dim, float theta);
+void gemma3_rope_precompute(float *freqs, int max_pos, int head_dim, float theta,
+                            float scaling);
 
 /**
  * Apply precomputed RoPE frequencies
