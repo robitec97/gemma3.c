@@ -1,152 +1,190 @@
 # Makefile for gemma3.c
 #
 # Usage:
-#   make                - Build release (default)
-#   make debug          - Build with debug symbols
-#   make fast           - Build with aggressive optimizations
-#   make blas           - Build with OpenBLAS
-#   make threads        - Build with thread pool
-#   make blas-threads   - Build with OpenBLAS + thread pool
-#   make mps            - Build with Metal GPU acceleration (macOS)
-#   make mps-threads    - Build with Metal GPU + thread pool fallback
+#   make                - Optimized CPU build (native SIMD + thread pool)   [default]
+#   make mps            - Metal GPU build (macOS Apple Silicon), CPU fallback included
+#   make blas           - CPU build using BLAS sgemm for prompt processing
+#                         (Accelerate on macOS, OpenBLAS elsewhere)
+#   make portable       - CPU build without -march/-mcpu=native (for distributing binaries)
+#   make debug          - Debug symbols, no optimization
+#   make asan           - AddressSanitizer + UBSan build
+#   make test           - Build and run unit tests (no model needed)
+#   make test-model     - Run model-dependent tests (MODEL=path, default ./gemma-3-4b-it)
+#   make bench          - Build the end-to-end benchmark (./gemma3-bench)
+#   make bench-kernels  - Build and run kernel micro-benchmarks (no model needed)
 #   make clean          - Remove all build artifacts
 
 # --- Configuration ---
 
-CC ?= gcc
+CC ?= cc
 TARGET ?= gemma3
 BUILD_DIR ?= build
+MODEL ?= gemma-3-4b-it
 
-# Base Sources
-SRCS_BASE = gemma3.c \
-            gemma3_kernels.c \
-            gemma3_safetensors.c \
-            gemma3_tokenizer.c \
-            gemma3_transformer.c \
-            main.c
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 
-# Base Flags
-CFLAGS_BASE    = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP
-CFLAGS_RELEASE = -O3 -DNDEBUG
-CFLAGS_DEBUG   = -g -O0 -DDEBUG
-CFLAGS_FAST    = -O3 -march=native -ffast-math -DNDEBUG
+LIB_SRCS = gemma3.c \
+           gemma3_kernels.c \
+           gemma3_safetensors.c \
+           gemma3_threads.c \
+           gemma3_tokenizer.c \
+           gemma3_transformer.c
 
-LDFLAGS_BASE   = -lm
+CFLAGS_BASE = -Wall -Wextra -Wpedantic -std=c11 -MMD -MP -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE
+LDFLAGS_BASE = -lm -lpthread
 
-# --- Mode Logic (The Core Fix) ---
+# Native SIMD: -mcpu=native on arm64 (NEON is always on), -march=native on x86-64
+ifeq ($(UNAME_M),arm64)
+    NATIVE_FLAGS = -mcpu=native
+else ifeq ($(UNAME_M),aarch64)
+    NATIVE_FLAGS = -mcpu=native
+else
+    NATIVE_FLAGS = -march=native
+endif
 
-# Default mode is release
-MODE ?= release
+# Default mode (set by the convenience targets below)
+MODE ?= native
 
-# Initialize variables based on defaults
 CFLAGS = $(CFLAGS_BASE)
 LDFLAGS = $(LDFLAGS_BASE)
-SRCS = $(SRCS_BASE)
+SRCS = $(LIB_SRCS)
 SRCS_M =
 
-# Apply Mode-Specific configurations
-# This runs only when the recursive make is called with MODE set
-
-ifeq ($(MODE),release)
-    CFLAGS += $(CFLAGS_RELEASE)
+ifeq ($(MODE),native)
+    CFLAGS += -O3 -DNDEBUG $(NATIVE_FLAGS)
 endif
-
+ifeq ($(MODE),portable)
+    CFLAGS += -O3 -DNDEBUG
+endif
 ifeq ($(MODE),debug)
-    CFLAGS += $(CFLAGS_DEBUG)
+    CFLAGS += -g -O0 -DDEBUG
 endif
-
-ifeq ($(MODE),fast)
-    CFLAGS += $(CFLAGS_FAST)
+ifeq ($(MODE),asan)
+    CFLAGS += -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+    LDFLAGS += -fsanitize=address,undefined
 endif
-
-# Check for BLAS in the mode string
-ifneq (,$(findstring blas,$(MODE)))
-    CFLAGS += $(CFLAGS_FAST) -DUSE_BLAS
-    LDFLAGS += -lopenblas
+ifeq ($(MODE),blas)
+    CFLAGS += -O3 -DNDEBUG $(NATIVE_FLAGS) -DUSE_BLAS
+    ifeq ($(UNAME_S),Darwin)
+        CFLAGS += -DACCELERATE_NEW_LAPACK
+        LDFLAGS += -framework Accelerate
+    else
+        LDFLAGS += -lopenblas
+    endif
 endif
-
-# Check for THREADS in the mode string
-ifneq (,$(findstring threads,$(MODE)))
-    CFLAGS += $(CFLAGS_FAST) -DUSE_THREADS
-    LDFLAGS += -lpthread
-    SRCS += gemma3_threads.c
-endif
-
-# Check for MPS (Metal) in the mode string
-ifneq (,$(findstring mps,$(MODE)))
-    CFLAGS += $(CFLAGS_FAST) -DUSE_MPS
+ifeq ($(MODE),mps)
+    CFLAGS += -O3 -DNDEBUG $(NATIVE_FLAGS) -DUSE_MPS
     LDFLAGS += -framework Metal -framework Foundation
     SRCS_M += gemma3_metal.m
 endif
 
-# Calculate Objects based on the current MODE
-# Split into C and Objective-C objects for different compilation rules
-OBJS_C = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS))
-OBJS_M = $(patsubst %.m, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS_M))
-OBJS = $(OBJS_C) $(OBJS_M)
+OBJS_LIB = $(patsubst %.c, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS)) \
+           $(patsubst %.m, $(BUILD_DIR)/$(MODE)/%.o, $(SRCS_M))
+OBJ_MAIN = $(BUILD_DIR)/$(MODE)/main.o
 
 # --- Convenience Targets ---
-# These targets just re-run make with a specific MODE
 
-.PHONY: all debug fast blas threads blas-threads mps mps-threads clean help
+.PHONY: all native portable debug asan blas mps fast threads blas-threads mps-threads \
+        build_core test test-kernels test-model bench bench-kernels clean help
 
-all:
-	@$(MAKE) --no-print-directory build_core MODE=release
+all: native
+
+native:
+	@$(MAKE) --no-print-directory build_core MODE=native
+
+portable:
+	@$(MAKE) --no-print-directory build_core MODE=portable
 
 debug:
 	@$(MAKE) --no-print-directory build_core MODE=debug
 
-fast:
-	@$(MAKE) --no-print-directory build_core MODE=fast
+asan:
+	@$(MAKE) --no-print-directory build_core MODE=asan
 
 blas:
 	@$(MAKE) --no-print-directory build_core MODE=blas
 
-threads:
-	@$(MAKE) --no-print-directory build_core MODE=threads
-
-blas-threads:
-	@$(MAKE) --no-print-directory build_core MODE=blas-threads
-
 mps:
 	@$(MAKE) --no-print-directory build_core MODE=mps CC=clang
 
-mps-threads:
-	@$(MAKE) --no-print-directory build_core MODE=mps-threads CC=clang
+# Older target names (threads are now always enabled)
+fast threads: native
+blas-threads: blas
+mps-threads: mps
 
-# --- The Real Build Target ---
-
-# This target does the actual work. 
-# It expects MODE to be set correctly by the calls above.
 build_core: $(TARGET)
 
-$(TARGET): $(OBJS)
-	@echo "Linking $(TARGET) [$(MODE)]..."
-	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+$(TARGET): $(OBJS_LIB) $(OBJ_MAIN)
+	@echo "Linking $(TARGET) [$(MODE)]"
+	@$(CC) $(OBJS_LIB) $(OBJ_MAIN) -o $(TARGET) $(LDFLAGS)
 
-# The Compilation Rule
-# Now we can explicitly use $(MODE) in the path because it is constant for this run
 $(BUILD_DIR)/$(MODE)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	@echo "CC $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/$(MODE)/%.o: %.m
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@
+	@echo "CC $<"
+	@$(CC) $(CFLAGS) -Wno-overlength-strings -fobjc-arc -c $< -o $@
 
-# Include dependencies
 -include $(wildcard $(BUILD_DIR)/*/*.d)
 
+# --- Tests and benchmarks ---
+
+# Library objects of the current MODE (tests/benches link against these)
+lib_objs: $(OBJS_LIB)
+
+gemma3-test: tests/test_kernels.c $(OBJS_LIB)
+	@echo "Linking gemma3-test [$(MODE)]"
+	@$(CC) $(CFLAGS) tests/test_kernels.c $(OBJS_LIB) -o $@ $(LDFLAGS)
+
+gemma3-bench: bench/bench_e2e.c $(OBJS_LIB)
+	@echo "Linking gemma3-bench [$(MODE)]"
+	@$(CC) $(CFLAGS) bench/bench_e2e.c $(OBJS_LIB) -o $@ $(LDFLAGS)
+
+gemma3-bench-kernels: bench/bench_kernels.c $(OBJS_LIB)
+	@echo "Linking gemma3-bench-kernels [$(MODE)]"
+	@$(CC) $(CFLAGS) bench/bench_kernels.c $(OBJS_LIB) -o $@ $(LDFLAGS)
+
+test test-kernels:
+	@$(MAKE) --no-print-directory gemma3-test
+	./gemma3-test
+
+test-model:
+	@$(MAKE) --no-print-directory build_core
+	@$(MAKE) --no-print-directory gemma3-test-tokenizer
+	./gemma3-test-tokenizer $(MODEL)/tokenizer.model tests/tokenizer_golden.tsv
+	./tests/test_e2e.sh ./$(TARGET) $(MODEL)
+
+gemma3-test-tokenizer: tests/test_tokenizer.c $(OBJS_LIB)
+	@echo "Linking gemma3-test-tokenizer [$(MODE)]"
+	@$(CC) $(CFLAGS) tests/test_tokenizer.c $(OBJS_LIB) -o $@ $(LDFLAGS)
+
+bench:
+	@$(MAKE) --no-print-directory gemma3-bench
+
+bench-kernels:
+	@$(MAKE) --no-print-directory gemma3-bench-kernels
+	./gemma3-bench-kernels
+
 clean:
-	rm -rf $(TARGET) $(BUILD_DIR)
+	rm -rf $(TARGET) $(BUILD_DIR) gemma3-test gemma3-test-tokenizer gemma3-bench gemma3-bench-kernels
 
 help:
-	@echo "Available targets:"
-	@echo "  make              : Release build"
-	@echo "  make debug        : Debug build"
-	@echo "  make fast         : Native optimizations"
-	@echo "  make blas         : OpenBLAS"
-	@echo "  make threads      : Thread pool"
-	@echo "  make blas-threads : OpenBLAS + Threads"
-	@echo "  make mps          : Metal GPU (macOS Apple Silicon)"
-	@echo "  make mps-threads  : Metal GPU + Thread pool fallback"
+	@echo "Build targets:"
+	@echo "  make               Optimized CPU build: native SIMD (NEON/AVX2) + threads [default]"
+	@echo "  make mps           Metal GPU build for Apple Silicon (CPU fallback included)"
+	@echo "  make blas          CPU build with BLAS prompt processing (Accelerate / OpenBLAS)"
+	@echo "  make portable      CPU build without native CPU tuning"
+	@echo "  make debug         Debug build"
+	@echo "  make asan          AddressSanitizer + UndefinedBehaviorSanitizer build"
+	@echo ""
+	@echo "Testing and benchmarking:"
+	@echo "  make test          Unit tests for kernels, sampler and thread pool (no model)"
+	@echo "  make test-model    Tokenizer golden tests + end-to-end checks (needs model)"
+	@echo "  make bench         Build ./gemma3-bench (end-to-end tokens/s, needs model)"
+	@echo "  make bench-kernels Kernel micro-benchmarks (GB/s, GFLOP/s; no model)"
+	@echo ""
+	@echo "Variables: MODE=native|portable|debug|asan|blas|mps  MODEL=<dir>  CC=<compiler>"

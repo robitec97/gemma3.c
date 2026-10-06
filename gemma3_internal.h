@@ -109,6 +109,14 @@ int gemma3_transformer_get_pos(gemma3_transformer *t);
 const char *gemma3_transformer_backend(const gemma3_transformer *t);
 int gemma3_transformer_num_threads(const gemma3_transformer *t);
 
+/* Generation checks *flag between prefill chunks and stops with
+ * GEMMA3_ERR_ABORTED when it becomes non-zero. */
+void gemma3_transformer_set_abort_flag(gemma3_transformer *t, const volatile int *flag);
+
+/* Whether the KV cache, filled up to from_pos, can be rewound to to_pos and
+ * extended from there (local layers keep only a ring of recent positions). */
+int gemma3_transformer_can_rewind(const gemma3_transformer *t, int from_pos, int to_pos);
+
 #ifdef __cplusplus
 }
 #endif

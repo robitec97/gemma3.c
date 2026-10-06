@@ -4,186 +4,49 @@
  * Implements the Gemma 3 transformer architecture:
  * - Grouped Query Attention (GQA) with 8 Q heads and 4 KV heads
  * - Hybrid local/global attention (5:1 ratio)
- * - SwiGLU MLP
+ * - GELU-gated MLP
  * - RMSNorm with additional pre/post feedforward norms
- * - RoPE with layer-specific theta
+ * - RoPE with layer-specific theta (and linear scaling on global layers)
+ *
+ * Prefill and decode share one code path: tokens are processed in chunks of
+ * up to GEMMA3_PREFILL_CHUNK, so every projection is a batched BF16 GEMM that
+ * reads each weight once per chunk. Decoding is simply a chunk of one token.
  */
 
 #include "gemma3_internal.h"
 #include "gemma3_kernels.h"
-#ifdef USE_THREADS
 #include "gemma3_threads.h"
-#endif
 #ifdef USE_MPS
 #include "gemma3_metal.h"
 #endif
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-/* Helper to dispatch matvec_bf16 to threaded or single-threaded path */
-static inline void matvec_bf16_dispatch(float *y, const uint16_t *A, const float *x,
-                                         int M, int K, float *scratch, void *pool) {
-#ifdef USE_THREADS
-    if (pool) {
-        gemma3_matvec_bf16_mt(y, A, x, M, K, scratch, (gemma3_thread_pool *)pool);
-        return;
-    }
-#else
-    (void)pool;
-#endif
-    gemma3_matvec_bf16(y, A, x, M, K, scratch);
-}
-
 /* ============================================================================
- * Internal Structures (shared with gemma3.c)
+ * KV Cache
  * ========================================================================== */
 
-
-/* KV Cache for a single layer */
+/* KV cache for a single layer. Position p is stored in row
+ * (ring > 0 ? p % ring : p). Global layers keep every position; local
+ * layers keep a ring of sliding_window + GEMMA3_LOCAL_RING_EXTRA rows. */
 typedef struct {
-    float *k;  /* [max_seq, num_kv_heads, head_dim] */
-    float *v;  /* [max_seq, num_kv_heads, head_dim] */
-    int pos;   /* Current position (for ring buffer on local layers) */
+    float *k;   /* [rows, num_kv_heads * head_dim] */
+    float *v;   /* [rows, num_kv_heads * head_dim] */
+    int rows;
+    int ring;   /* 0 = linear (global layer) */
 } layer_kv_cache;
 
-/* Full KV cache */
 struct gemma3_kv_cache {
     layer_kv_cache layers[GEMMA3_NUM_LAYERS];
     int max_seq;
-    int current_pos;  /* Global sequence position */
+    int current_pos;  /* number of positions currently cached */
 };
 
-/* ============================================================================
- * Activation Buffers
- * ========================================================================== */
-
-typedef struct {
-    float *x;           /* [hidden_size] - current hidden state */
-    float *x_norm;      /* [hidden_size] - normalized hidden state */
-    float *q;           /* [num_heads * head_dim] - query */
-    float *k;           /* [num_kv_heads * head_dim] - key */
-    float *v;           /* [num_kv_heads * head_dim] - value */
-    float *attn_out;    /* [num_heads * head_dim] - attention output */
-    float *proj_out;    /* [hidden_size] - projection output */
-    float *mlp_gate;    /* [intermediate_size] - MLP gate */
-    float *mlp_up;      /* [intermediate_size] - MLP up */
-    float *mlp_out;     /* [hidden_size] - MLP output */
-    float *logits;      /* [vocab_size] - output logits */
-    float *mask;        /* [max_seq] - attention mask */
-    float *attn_scores; /* [max_context] - pre-allocated attention scores */
-    float *matvec_tmp;  /* [vocab_size] - scratch buffer for BF16 matvec BLAS path */
-} activation_buffers;
-
-static activation_buffers *alloc_buffers(const gemma3_config *cfg) {
-    activation_buffers *buf = (activation_buffers *)calloc(1, sizeof(activation_buffers));
-    if (!buf) return NULL;
-
-    buf->x = (float *)malloc(cfg->hidden_size * sizeof(float));
-    buf->x_norm = (float *)malloc(cfg->hidden_size * sizeof(float));
-    buf->q = (float *)malloc(cfg->num_heads * cfg->head_dim * sizeof(float));
-    buf->k = (float *)malloc(cfg->num_kv_heads * cfg->head_dim * sizeof(float));
-    buf->v = (float *)malloc(cfg->num_kv_heads * cfg->head_dim * sizeof(float));
-    buf->attn_out = (float *)malloc(cfg->num_heads * cfg->head_dim * sizeof(float));
-    buf->proj_out = (float *)malloc(cfg->hidden_size * sizeof(float));
-    buf->mlp_gate = (float *)malloc(cfg->intermediate_size * sizeof(float));
-    buf->mlp_up = (float *)malloc(cfg->intermediate_size * sizeof(float));
-    buf->mlp_out = (float *)malloc(cfg->hidden_size * sizeof(float));
-    buf->logits = (float *)malloc(cfg->vocab_size * sizeof(float));
-    buf->mask = (float *)malloc(cfg->max_context * sizeof(float));
-    buf->attn_scores = (float *)malloc(cfg->max_context * sizeof(float));
-    /* vocab_size is the largest row dimension for matvec; reuse for BF16 conversion */
-    int matvec_max = cfg->vocab_size > cfg->intermediate_size ? cfg->vocab_size : cfg->intermediate_size;
-    buf->matvec_tmp = (float *)malloc(matvec_max * sizeof(float));
-
-    if (!buf->x || !buf->x_norm || !buf->q || !buf->k || !buf->v ||
-        !buf->attn_out || !buf->proj_out || !buf->mlp_gate || !buf->mlp_up ||
-        !buf->mlp_out || !buf->logits || !buf->mask || !buf->attn_scores ||
-        !buf->matvec_tmp) {
-        free(buf->x);
-        free(buf->x_norm);
-        free(buf->q);
-        free(buf->k);
-        free(buf->v);
-        free(buf->attn_out);
-        free(buf->proj_out);
-        free(buf->mlp_gate);
-        free(buf->mlp_up);
-        free(buf->mlp_out);
-        free(buf->logits);
-        free(buf->mask);
-        free(buf->attn_scores);
-        free(buf->matvec_tmp);
-        free(buf);
-        return NULL;
-    }
-
-    return buf;
-}
-
-static void free_buffers(activation_buffers *buf) {
-    if (!buf) return;
-    free(buf->x);
-    free(buf->x_norm);
-    free(buf->q);
-    free(buf->k);
-    free(buf->v);
-    free(buf->attn_out);
-    free(buf->proj_out);
-    free(buf->mlp_gate);
-    free(buf->mlp_up);
-    free(buf->mlp_out);
-    free(buf->logits);
-    free(buf->mask);
-    free(buf->attn_scores);
-    free(buf->matvec_tmp);
-    free(buf);
-}
-
-/* ============================================================================
- * KV Cache Management
- * ========================================================================== */
-
-gemma3_kv_cache *gemma3_kv_cache_alloc(const gemma3_config *cfg, int max_seq) {
-    gemma3_kv_cache *cache = (gemma3_kv_cache *)calloc(1, sizeof(gemma3_kv_cache));
-    if (!cache) return NULL;
-
-    cache->max_seq = max_seq;
-    cache->current_pos = 0;
-
-    int kv_size = cfg->num_kv_heads * cfg->head_dim;
-
-    for (int l = 0; l < cfg->num_layers; l++) {
-        /* For local layers with sliding window, we only need window_size entries */
-        int layer_max_seq;
-        if (gemma3_is_global_layer(l)) {
-            layer_max_seq = max_seq;  /* Global: full context */
-        } else {
-            layer_max_seq = cfg->sliding_window;  /* Local: ring buffer */
-        }
-
-        cache->layers[l].k = (float *)calloc(layer_max_seq * kv_size, sizeof(float));
-        cache->layers[l].v = (float *)calloc(layer_max_seq * kv_size, sizeof(float));
-        cache->layers[l].pos = 0;
-
-        if (!cache->layers[l].k || !cache->layers[l].v) {
-            /* Cleanup on failure */
-            for (int j = 0; j <= l; j++) {
-                free(cache->layers[j].k);
-                free(cache->layers[j].v);
-            }
-            free(cache);
-            return NULL;
-        }
-    }
-
-    return cache;
-}
-
-void gemma3_kv_cache_free(gemma3_kv_cache *cache) {
+static void kv_cache_free(gemma3_kv_cache *cache) {
     if (!cache) return;
-
     for (int l = 0; l < GEMMA3_NUM_LAYERS; l++) {
         free(cache->layers[l].k);
         free(cache->layers[l].v);
@@ -191,625 +54,366 @@ void gemma3_kv_cache_free(gemma3_kv_cache *cache) {
     free(cache);
 }
 
-void gemma3_kv_cache_reset(gemma3_kv_cache *cache) {
-    if (!cache) return;
+static gemma3_kv_cache *kv_cache_alloc(const gemma3_config *cfg, int max_seq) {
+    gemma3_kv_cache *cache = (gemma3_kv_cache *)calloc(1, sizeof(gemma3_kv_cache));
+    if (!cache) return NULL;
+    cache->max_seq = max_seq;
 
-    cache->current_pos = 0;
-    for (int l = 0; l < GEMMA3_NUM_LAYERS; l++) {
-        cache->layers[l].pos = 0;
-    }
-}
+    size_t kv_size = (size_t)cfg->num_kv_heads * cfg->head_dim;
+    int ring_rows = gemma3_local_ring_size(cfg->sliding_window);
 
-/* Add KV to cache for a layer */
-static void cache_kv(layer_kv_cache *cache, const float *k, const float *v,
-                     int kv_size, int is_global, int sliding_window, int pos) {
-    int cache_pos;
-
-    if (is_global) {
-        /* Global layer: simple append */
-        cache_pos = pos;
-    } else {
-        /* Local layer: ring buffer */
-        cache_pos = pos % sliding_window;
-    }
-
-    memcpy(cache->k + cache_pos * kv_size, k, kv_size * sizeof(float));
-    memcpy(cache->v + cache_pos * kv_size, v, kv_size * sizeof(float));
-    cache->pos = pos + 1;
-}
-
-/* ============================================================================
- * Attention Implementation
- * ========================================================================== */
-
-/* Compute attention for a single layer */
-static void layer_attention(
-    float *output,           /* [hidden_size] */
-    const float *x,          /* [hidden_size] - input */
-    const uint16_t *q_weight,   /* [num_heads * head_dim, hidden_size] BF16 */
-    const uint16_t *k_weight,   /* [num_kv_heads * head_dim, hidden_size] BF16 */
-    const uint16_t *v_weight,   /* [num_kv_heads * head_dim, hidden_size] BF16 */
-    const uint16_t *o_weight,   /* [hidden_size, num_heads * head_dim] BF16 */
-    const uint16_t *q_norm,     /* [head_dim] BF16 - QK normalization */
-    const uint16_t *k_norm,     /* [head_dim] BF16 - QK normalization */
-    layer_kv_cache *cache,
-    float *q_buf,            /* [num_heads * head_dim] */
-    float *k_buf,            /* [num_kv_heads * head_dim] */
-    float *v_buf,            /* [num_kv_heads * head_dim] */
-    float *attn_buf,         /* [num_heads * head_dim] */
-    float *mask_buf,         /* [max_seq] */
-    float *scores_buf,       /* [max_seq] - pre-allocated attention scores */
-    float *matvec_tmp,       /* scratch buffer for BF16 matvec */
-    const float *rope_freqs, /* precomputed RoPE cos/sin table */
-    void *thread_pool,       /* gemma3_thread_pool* or NULL */
-    const gemma3_config *cfg,
-    int layer_idx,
-    int pos
-) {
-    int num_heads = cfg->num_heads;
-    int num_kv_heads = cfg->num_kv_heads;
-    int head_dim = cfg->head_dim;
-    int hidden_size = cfg->hidden_size;
-
-    int q_size = num_heads * head_dim;
-    int kv_size = num_kv_heads * head_dim;
-
-    /* Project Q, K, V (BF16 weights) */
-    matvec_bf16_dispatch(q_buf, q_weight, x, q_size, hidden_size, matvec_tmp, thread_pool);
-    matvec_bf16_dispatch(k_buf, k_weight, x, kv_size, hidden_size, matvec_tmp, thread_pool);
-    matvec_bf16_dispatch(v_buf, v_weight, x, kv_size, hidden_size, matvec_tmp, thread_pool);
-
-    /* Apply QK normalization (per-head RMSNorm with BF16 weights) */
-    if (q_norm && k_norm) {
-        for (int h = 0; h < num_heads; h++) {
-            gemma3_rmsnorm_bf16(q_buf + h * head_dim, q_buf + h * head_dim,
-                                q_norm, head_dim, cfg->rmsnorm_eps);
-        }
-        for (int h = 0; h < num_kv_heads; h++) {
-            gemma3_rmsnorm_bf16(k_buf + h * head_dim, k_buf + h * head_dim,
-                                k_norm, head_dim, cfg->rmsnorm_eps);
-        }
-    }
-
-    /* Apply RoPE using precomputed cos/sin tables */
-    for (int h = 0; h < num_heads; h++) {
-        gemma3_rope_apply_precomputed(q_buf + h * head_dim, rope_freqs, head_dim, pos);
-    }
-    for (int h = 0; h < num_kv_heads; h++) {
-        gemma3_rope_apply_precomputed(k_buf + h * head_dim, rope_freqs, head_dim, pos);
-    }
-
-    /* Add K, V to cache */
-    int is_global = gemma3_is_global_layer(layer_idx);
-    cache_kv(cache, k_buf, v_buf, kv_size, is_global, cfg->sliding_window, pos);
-
-    /* Determine attention range */
-    int seq_len;
-    const float *k_cache, *v_cache;
-
-    if (is_global) {
-        /* Global attention: attend to all previous positions */
-        seq_len = pos + 1;
-        k_cache = cache->k;
-        v_cache = cache->v;
-
-        /* Causal mask */
-        gemma3_causal_mask(mask_buf, seq_len, pos);
-    } else {
-        /* Local attention: sliding window */
-        int window = cfg->sliding_window;
-        int start_pos = (pos >= window) ? pos - window + 1 : 0;
-        seq_len = pos - start_pos + 1;
-
-        /* For ring buffer, we need to handle wraparound */
-        /* Simplified: just use the cached entries that are valid */
-        seq_len = (pos < window) ? pos + 1 : window;
-        k_cache = cache->k;
-        v_cache = cache->v;
-
-        /* Sliding window mask */
-        for (int i = 0; i < seq_len; i++) {
-            mask_buf[i] = 0.0f;  /* All positions in window are valid */
-        }
-    }
-
-    /* Compute scaled dot-product attention with GQA */
-    float scale = 1.0f / sqrtf((float)head_dim);
-    gemma3_gqa(attn_buf, q_buf, k_cache, v_cache,
-               num_heads, num_kv_heads, seq_len, head_dim,
-               scale, mask_buf, scores_buf);
-
-    /* Output projection (BF16 weights) */
-    matvec_bf16_dispatch(output, o_weight, attn_buf, hidden_size, q_size, matvec_tmp, thread_pool);
-}
-
-/* ============================================================================
- * MLP Implementation (SwiGLU)
- * ========================================================================== */
-
-static void layer_mlp(
-    float *output,            /* [hidden_size] */
-    const float *x,           /* [hidden_size] */
-    const uint16_t *gate_weight, /* [intermediate_size, hidden_size] BF16 */
-    const uint16_t *up_weight,   /* [intermediate_size, hidden_size] BF16 */
-    const uint16_t *down_weight, /* [hidden_size, intermediate_size] BF16 */
-    float *gate_buf,          /* [intermediate_size] */
-    float *up_buf,            /* [intermediate_size] */
-    float *matvec_tmp,        /* scratch buffer for BF16 matvec */
-    void *thread_pool,        /* gemma3_thread_pool* or NULL */
-    const gemma3_config *cfg,
-    int layer_idx,
-    int pos
-) {
-    int hidden_size = cfg->hidden_size;
-    int intermediate_size = cfg->intermediate_size;
-
-    /* Gate and up projections (BF16 weights) */
-    matvec_bf16_dispatch(gate_buf, gate_weight, x, intermediate_size, hidden_size, matvec_tmp, thread_pool);
-    matvec_bf16_dispatch(up_buf, up_weight, x, intermediate_size, hidden_size, matvec_tmp, thread_pool);
-
-    /* SwiGLU: gate = SiLU(gate) * up */
-    /* Gemma 3 uses GELU instead of SiLU for the gate */
-    gemma3_gelu_tanh_inplace(gate_buf, intermediate_size);
-    gemma3_vec_mul(gate_buf, gate_buf, up_buf, intermediate_size);
-
-    /* Down projection (BF16 weights) */
-    matvec_bf16_dispatch(output, down_weight, gate_buf, hidden_size, intermediate_size, matvec_tmp, thread_pool);
-
-    (void)layer_idx;
-    (void)pos;
-}
-
-/* ============================================================================
- * Full Forward Pass
- * ========================================================================== */
-
-/* Forward pass for a single token */
-int gemma3_transformer_forward(
-    float *logits,            /* Output: [vocab_size] (only written if compute_logits) */
-    int token_id,             /* Input token */
-    int pos,                  /* Position in sequence */
-    const gemma3_weights_t *weights,
-    gemma3_kv_cache *cache,
-    activation_buffers *buf,
-    const gemma3_config *cfg,
-    int compute_logits,       /* If false, skip final norm + vocab projection */
-    const float *rope_freqs_local,  /* precomputed RoPE for local layers */
-    const float *rope_freqs_global, /* precomputed RoPE for global layers */
-    void *thread_pool               /* gemma3_thread_pool* or NULL */
-) {
-    int hidden_size = cfg->hidden_size;
-    int vocab_size = cfg->vocab_size;
-
-    /* Token embedding lookup (BF16) */
-    gemma3_embed_bf16(buf->x, weights->embed_tokens, token_id, hidden_size);
-    const float *embed = buf->x;  /* buf->x now contains the F32 embedding */
-
-    /* Gemma scales embeddings by sqrt(hidden_size) */
-    float embed_scale = sqrtf((float)hidden_size);
-    for (int i = 0; i < hidden_size; i++) {
-        buf->x[i] = embed[i] * embed_scale;
-    }
-
-    /* Process each layer */
     for (int l = 0; l < cfg->num_layers; l++) {
-        const uint16_t *layer_weights_input_ln = weights->layers[l].input_layernorm;
-        const uint16_t *layer_weights_q = weights->layers[l].q_proj;
-        const uint16_t *layer_weights_k = weights->layers[l].k_proj;
-        const uint16_t *layer_weights_v = weights->layers[l].v_proj;
-        const uint16_t *layer_weights_o = weights->layers[l].o_proj;
-        const uint16_t *layer_weights_q_norm = weights->layers[l].q_norm;
-        const uint16_t *layer_weights_k_norm = weights->layers[l].k_norm;
-        const uint16_t *layer_weights_post_attn_ln = weights->layers[l].post_attention_layernorm;
-        const uint16_t *layer_weights_gate = weights->layers[l].gate_proj;
-        const uint16_t *layer_weights_up = weights->layers[l].up_proj;
-        const uint16_t *layer_weights_down = weights->layers[l].down_proj;
-        const uint16_t *layer_weights_pre_ff_ln = weights->layers[l].pre_feedforward_layernorm;
-        const uint16_t *layer_weights_post_ff_ln = weights->layers[l].post_feedforward_layernorm;
-
-        /* === Self-Attention Block === */
-
-        /* Pre-attention RMSNorm (BF16 weights) */
-        gemma3_rmsnorm_bf16(buf->x_norm, buf->x, layer_weights_input_ln,
-                            hidden_size, cfg->rmsnorm_eps);
-
-        /* Attention */
-        const float *rope_freqs = gemma3_is_global_layer(l) ? rope_freqs_global : rope_freqs_local;
-        layer_attention(
-            buf->proj_out,
-            buf->x_norm,
-            layer_weights_q, layer_weights_k, layer_weights_v, layer_weights_o,
-            layer_weights_q_norm, layer_weights_k_norm,
-            &cache->layers[l],
-            buf->q, buf->k, buf->v, buf->attn_out, buf->mask,
-            buf->attn_scores, buf->matvec_tmp,
-            rope_freqs, thread_pool,
-            cfg, l, pos
-        );
-
-        /* Post-attention RMSNorm (Gemma 2/3 specific, BF16 weights with 1+weight) */
-        if (layer_weights_post_attn_ln) {
-            gemma3_rmsnorm_bf16_inplace(buf->proj_out, layer_weights_post_attn_ln,
-                                        hidden_size, cfg->rmsnorm_eps);
-        }
-
-        /* Residual connection */
-        gemma3_vec_add(buf->x, buf->x, buf->proj_out, hidden_size);
-
-        /* === MLP Block === */
-
-        /* Pre-feedforward RMSNorm (Gemma 3 specific, BF16 weights) */
-        if (layer_weights_pre_ff_ln) {
-            gemma3_rmsnorm_bf16(buf->x_norm, buf->x, layer_weights_pre_ff_ln,
-                                hidden_size, cfg->rmsnorm_eps);
+        layer_kv_cache *lc = &cache->layers[l];
+        if (gemma3_is_global_layer(l) || ring_rows >= max_seq) {
+            lc->rows = max_seq;
+            lc->ring = 0;
         } else {
-            gemma3_vec_copy(buf->x_norm, buf->x, hidden_size);
+            lc->rows = ring_rows;
+            lc->ring = ring_rows;
         }
-
-        /* MLP */
-        layer_mlp(
-            buf->mlp_out,
-            buf->x_norm,
-            layer_weights_gate, layer_weights_up, layer_weights_down,
-            buf->mlp_gate, buf->mlp_up,
-            buf->matvec_tmp, thread_pool,
-            cfg, l, pos
-        );
-
-        /* Post-feedforward RMSNorm (Gemma 2/3 specific, BF16 weights with 1+weight) */
-        if (layer_weights_post_ff_ln) {
-            gemma3_rmsnorm_bf16_inplace(buf->mlp_out, layer_weights_post_ff_ln,
-                                        hidden_size, cfg->rmsnorm_eps);
-        }
-
-        /* Residual connection */
-        gemma3_vec_add(buf->x, buf->x, buf->mlp_out, hidden_size);
-    }
-
-    /* Skip final norm + vocab projection during prefill (non-last tokens) */
-    if (compute_logits) {
-        /* Final RMSNorm (BF16 weights) */
-        gemma3_rmsnorm_bf16(buf->x_norm, buf->x, weights->norm, hidden_size, cfg->rmsnorm_eps);
-
-        /* Output projection (tied embeddings, BF16) */
-        /* logits = x_norm @ embed_tokens.T */
-        matvec_bf16_dispatch(logits, weights->embed_tokens, buf->x_norm, vocab_size, hidden_size, buf->matvec_tmp, thread_pool);
-    }
-
-    return 0;
-}
-
-/* Convert a BF16 weight matrix to F32 into a pre-allocated buffer */
-static void bf16_matrix_to_f32(float *dst, const uint16_t *src, int rows, int cols) {
-    int n = rows * cols;
-    for (int i = 0; i < n; i++) {
-        uint32_t bits = ((uint32_t)src[i]) << 16;
-        __builtin_memcpy(&dst[i], &bits, sizeof(float));
-    }
-}
-
-#ifdef USE_BLAS
-/* Batched prefill: process all tokens through each layer using sgemm.
- * Linear projections become matrix-matrix multiplies; attention remains per-token. */
-static int gemma3_transformer_prefill_batched(
-    float *logits,
-    const int *tokens,
-    int num_tokens,
-    int start_pos,
-    const gemma3_weights_t *weights,
-    gemma3_kv_cache *cache,
-    activation_buffers *buf,
-    const gemma3_config *cfg,
-    const float *rope_freqs_local,
-    const float *rope_freqs_global,
-    void *thread_pool
-) {
-    (void)thread_pool;
-
-    int hidden_size = cfg->hidden_size;
-    int intermediate_size = cfg->intermediate_size;
-    int num_heads = cfg->num_heads;
-    int num_kv_heads = cfg->num_kv_heads;
-    int head_dim = cfg->head_dim;
-    int q_size = num_heads * head_dim;
-    int kv_size = num_kv_heads * head_dim;
-    int N = num_tokens;
-
-    /* Allocate batched activation matrices:
-     * X: [N, hidden_size], X_norm: [N, hidden_size]
-     * Q_all: [N, q_size], K_all: [N, kv_size], V_all: [N, kv_size]
-     * attn_out_all: [N, q_size], proj_out_all: [N, hidden_size]
-     * gate_all: [N, intermediate_size], up_all: [N, intermediate_size]
-     * mlp_out_all: [N, hidden_size] */
-    size_t total_size = (size_t)N * (
-        hidden_size * 3 +       /* X, X_norm, proj_out */
-        q_size * 2 +            /* Q, attn_out */
-        kv_size * 2 +           /* K, V */
-        hidden_size +           /* mlp_out */
-        intermediate_size * 2   /* gate, up */
-    );
-    /* Weight conversion buffer: largest weight is embed [vocab_size, hidden_size] or
-     * intermediate [intermediate_size, hidden_size]. For per-layer we need max of:
-     * q_proj: [q_size, hidden_size], gate/up/down: [intermediate_size, hidden_size] */
-    int max_weight_elems = intermediate_size * hidden_size;
-    if (q_size * hidden_size > max_weight_elems) max_weight_elems = q_size * hidden_size;
-    if (hidden_size * q_size > max_weight_elems) max_weight_elems = hidden_size * q_size;
-    if (hidden_size * intermediate_size > max_weight_elems) max_weight_elems = hidden_size * intermediate_size;
-
-    float *batch_buf = (float *)malloc(total_size * sizeof(float));
-    float *weight_f32 = (float *)malloc(max_weight_elems * sizeof(float));
-    if (!batch_buf || !weight_f32) {
-        free(batch_buf);
-        free(weight_f32);
-        /* Fall back to sequential */
-        goto sequential_fallback;
-    }
-
-    /* Assign sub-buffers */
-    float *X       = batch_buf;
-    float *X_norm  = X + N * hidden_size;
-    float *Q_all   = X_norm + N * hidden_size;
-    float *K_all   = Q_all + N * q_size;
-    float *V_all   = K_all + N * kv_size;
-    float *attn_out_all = V_all + N * kv_size;
-    float *proj_out_all = attn_out_all + N * q_size;
-    float *gate_all = proj_out_all + N * hidden_size;
-    float *up_all  = gate_all + N * intermediate_size;
-    float *mlp_out_all = up_all + N * intermediate_size;
-
-    /* Embed all tokens: X[i] = embed(tokens[i]) * sqrt(hidden_size) */
-    float embed_scale = sqrtf((float)hidden_size);
-    for (int i = 0; i < N; i++) {
-        gemma3_embed_bf16(X + i * hidden_size, weights->embed_tokens, tokens[i], hidden_size);
-        for (int j = 0; j < hidden_size; j++) {
-            X[i * hidden_size + j] *= embed_scale;
+        lc->k = (float *)malloc((size_t)lc->rows * kv_size * sizeof(float));
+        lc->v = (float *)malloc((size_t)lc->rows * kv_size * sizeof(float));
+        if (!lc->k || !lc->v) {
+            kv_cache_free(cache);
+            return NULL;
         }
     }
-
-    /* Process each layer */
-    for (int l = 0; l < cfg->num_layers; l++) {
-        int is_global = gemma3_is_global_layer(l);
-        const float *rope_freqs = is_global ? rope_freqs_global : rope_freqs_local;
-
-        /* --- Pre-attention RMSNorm (per-token, no good way to batch) --- */
-        for (int i = 0; i < N; i++) {
-            gemma3_rmsnorm_bf16(X_norm + i * hidden_size,
-                                X + i * hidden_size,
-                                weights->layers[l].input_layernorm,
-                                hidden_size, cfg->rmsnorm_eps);
-        }
-
-        /* --- Batched QKV projection ---
-         * Q_all = X_norm @ q_proj^T  ->  [N, hidden_size] @ [hidden_size, q_size] = [N, q_size]
-         * Weight is stored [q_size, hidden_size] in BF16, so we convert it and
-         * compute: Q_all = X_norm * W^T using sgemm */
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].q_proj, q_size, hidden_size);
-        /* C = alpha * A * B^T + beta * C
-         * A = X_norm [N, hidden_size], B = weight_f32 [q_size, hidden_size]
-         * C = Q_all [N, q_size]
-         * We want C[i,j] = sum_k X_norm[i,k] * W[j,k] = X_norm * W^T
-         * sgemm: CblasNoTrans for A, CblasTrans for B */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, q_size, hidden_size,
-                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
-                    0.0f, Q_all, q_size);
-
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].k_proj, kv_size, hidden_size);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, kv_size, hidden_size,
-                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
-                    0.0f, K_all, kv_size);
-
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].v_proj, kv_size, hidden_size);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, kv_size, hidden_size,
-                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
-                    0.0f, V_all, kv_size);
-
-        /* --- Per-token: QK norm, RoPE, cache KV, attention --- */
-        float scale = 1.0f / sqrtf((float)head_dim);
-        for (int i = 0; i < N; i++) {
-            int pos = start_pos + i;
-            float *qi = Q_all + i * q_size;
-            float *ki = K_all + i * kv_size;
-            float *vi = V_all + i * kv_size;
-
-            /* QK normalization */
-            if (weights->layers[l].q_norm && weights->layers[l].k_norm) {
-                for (int h = 0; h < num_heads; h++) {
-                    gemma3_rmsnorm_bf16(qi + h * head_dim, qi + h * head_dim,
-                                        weights->layers[l].q_norm, head_dim, cfg->rmsnorm_eps);
-                }
-                for (int h = 0; h < num_kv_heads; h++) {
-                    gemma3_rmsnorm_bf16(ki + h * head_dim, ki + h * head_dim,
-                                        weights->layers[l].k_norm, head_dim, cfg->rmsnorm_eps);
-                }
-            }
-
-            /* RoPE */
-            for (int h = 0; h < num_heads; h++) {
-                gemma3_rope_apply_precomputed(qi + h * head_dim, rope_freqs, head_dim, pos);
-            }
-            for (int h = 0; h < num_kv_heads; h++) {
-                gemma3_rope_apply_precomputed(ki + h * head_dim, rope_freqs, head_dim, pos);
-            }
-
-            /* Cache KV */
-            cache_kv(&cache->layers[l], ki, vi, kv_size, is_global,
-                     cfg->sliding_window, pos);
-
-            /* Attention (must be sequential due to causal dependency on cache) */
-            int seq_len;
-            const float *k_cache, *v_cache;
-            if (is_global) {
-                seq_len = pos + 1;
-                k_cache = cache->layers[l].k;
-                v_cache = cache->layers[l].v;
-                gemma3_causal_mask(buf->mask, seq_len, pos);
-            } else {
-                int window = cfg->sliding_window;
-                seq_len = (pos < window) ? pos + 1 : window;
-                k_cache = cache->layers[l].k;
-                v_cache = cache->layers[l].v;
-                for (int s = 0; s < seq_len; s++) buf->mask[s] = 0.0f;
-            }
-
-            gemma3_gqa(attn_out_all + i * q_size, qi, k_cache, v_cache,
-                       num_heads, num_kv_heads, seq_len, head_dim,
-                       scale, buf->mask, buf->attn_scores);
-        }
-
-        /* --- Batched output projection: proj_out = attn_out @ o_proj^T --- */
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].o_proj, hidden_size, q_size);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, hidden_size, q_size,
-                    1.0f, attn_out_all, q_size, weight_f32, q_size,
-                    0.0f, proj_out_all, hidden_size);
-
-        /* Post-attention RMSNorm + residual */
-        for (int i = 0; i < N; i++) {
-            if (weights->layers[l].post_attention_layernorm) {
-                gemma3_rmsnorm_bf16_inplace(proj_out_all + i * hidden_size,
-                                            weights->layers[l].post_attention_layernorm,
-                                            hidden_size, cfg->rmsnorm_eps);
-            }
-            gemma3_vec_add(X + i * hidden_size, X + i * hidden_size,
-                           proj_out_all + i * hidden_size, hidden_size);
-        }
-
-        /* --- MLP Block --- */
-        /* Pre-feedforward RMSNorm */
-        for (int i = 0; i < N; i++) {
-            if (weights->layers[l].pre_feedforward_layernorm) {
-                gemma3_rmsnorm_bf16(X_norm + i * hidden_size,
-                                    X + i * hidden_size,
-                                    weights->layers[l].pre_feedforward_layernorm,
-                                    hidden_size, cfg->rmsnorm_eps);
-            } else {
-                gemma3_vec_copy(X_norm + i * hidden_size, X + i * hidden_size, hidden_size);
-            }
-        }
-
-        /* Batched gate + up projections */
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].gate_proj, intermediate_size, hidden_size);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, intermediate_size, hidden_size,
-                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
-                    0.0f, gate_all, intermediate_size);
-
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].up_proj, intermediate_size, hidden_size);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, intermediate_size, hidden_size,
-                    1.0f, X_norm, hidden_size, weight_f32, hidden_size,
-                    0.0f, up_all, intermediate_size);
-
-        /* SwiGLU activation (per-token) */
-        for (int i = 0; i < N; i++) {
-            gemma3_gelu_tanh_inplace(gate_all + i * intermediate_size, intermediate_size);
-            gemma3_vec_mul(gate_all + i * intermediate_size,
-                           gate_all + i * intermediate_size,
-                           up_all + i * intermediate_size, intermediate_size);
-        }
-
-        /* Batched down projection */
-        bf16_matrix_to_f32(weight_f32, weights->layers[l].down_proj, hidden_size, intermediate_size);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    N, hidden_size, intermediate_size,
-                    1.0f, gate_all, intermediate_size, weight_f32, intermediate_size,
-                    0.0f, mlp_out_all, hidden_size);
-
-        /* Post-feedforward RMSNorm + residual */
-        for (int i = 0; i < N; i++) {
-            if (weights->layers[l].post_feedforward_layernorm) {
-                gemma3_rmsnorm_bf16_inplace(mlp_out_all + i * hidden_size,
-                                            weights->layers[l].post_feedforward_layernorm,
-                                            hidden_size, cfg->rmsnorm_eps);
-            }
-            gemma3_vec_add(X + i * hidden_size, X + i * hidden_size,
-                           mlp_out_all + i * hidden_size, hidden_size);
-        }
-    }
-
-    /* Final: compute logits only for the last token */
-    int last = N - 1;
-    gemma3_rmsnorm_bf16(buf->x_norm, X + last * hidden_size, weights->norm,
-                        hidden_size, cfg->rmsnorm_eps);
-    gemma3_matvec_bf16(logits, weights->embed_tokens, buf->x_norm,
-                       cfg->vocab_size, hidden_size, buf->matvec_tmp);
-
-    free(batch_buf);
-    free(weight_f32);
-    cache->current_pos = start_pos + num_tokens;
-    return 0;
-
-sequential_fallback:;
-    /* Fall through to sequential path below */
-    for (int i = 0; i < N; i++) {
-        int pos = start_pos + i;
-        int is_last = (i == N - 1);
-        gemma3_transformer_forward(logits, tokens[i], pos, weights, cache, buf, cfg, is_last,
-                                   rope_freqs_local, rope_freqs_global, thread_pool);
-    }
-    cache->current_pos = start_pos + num_tokens;
-    return 0;
-}
-#endif /* USE_BLAS */
-
-/* Prefill: process multiple tokens at once */
-int gemma3_transformer_prefill(
-    float *logits,            /* Output: [vocab_size] for last token */
-    const int *tokens,        /* Input tokens */
-    int num_tokens,           /* Number of tokens */
-    int start_pos,            /* Starting position */
-    const gemma3_weights_t *weights,
-    gemma3_kv_cache *cache,
-    activation_buffers *buf,
-    const gemma3_config *cfg,
-    const float *rope_freqs_local,
-    const float *rope_freqs_global,
-    void *thread_pool
-) {
-#ifdef USE_BLAS
-    /* Use batched prefill with sgemm when BLAS is available */
-    if (num_tokens > 1) {
-        return gemma3_transformer_prefill_batched(
-            logits, tokens, num_tokens, start_pos,
-            weights, cache, buf, cfg,
-            rope_freqs_local, rope_freqs_global, thread_pool);
-    }
-#endif
-    /* Sequential fallback for single tokens or non-BLAS builds */
-    for (int i = 0; i < num_tokens; i++) {
-        int pos = start_pos + i;
-        int is_last = (i == num_tokens - 1);
-
-        /* Only compute logits for last token — skips ~40% of work for others */
-        gemma3_transformer_forward(logits, tokens[i], pos, weights, cache, buf, cfg, is_last,
-                                   rope_freqs_local, rope_freqs_global, thread_pool);
-    }
-
-    cache->current_pos = start_pos + num_tokens;
-    return 0;
+    return cache;
 }
 
 /* ============================================================================
- * Transformer Context (combines weights, cache, buffers)
+ * Activation Buffers (sized for one prefill chunk)
  * ========================================================================== */
 
-typedef struct gemma3_transformer {
+typedef struct {
+    int cap;        /* tokens per chunk */
+    float *x;       /* [cap, hidden] residual stream */
+    float *xn;      /* [cap, hidden] normalized input */
+    float *q;       /* [cap, q_size] */
+    float *k;       /* [cap, kv_size] */
+    float *v;       /* [cap, kv_size] */
+    float *attn;    /* [cap, q_size] attention output */
+    float *proj;    /* [cap, hidden] projection output */
+    float *gate;    /* [cap, intermediate] */
+    float *up;      /* [cap, intermediate] */
+    float *scores;  /* [num_threads, max_context] attention scores */
+    int score_stride;
+} activation_buffers;
+
+static void free_buffers(activation_buffers *b) {
+    if (!b) return;
+    free(b->x); free(b->xn); free(b->q); free(b->k); free(b->v);
+    free(b->attn); free(b->proj); free(b->gate); free(b->up); free(b->scores);
+    free(b);
+}
+
+static activation_buffers *alloc_buffers(const gemma3_config *cfg, int cap,
+                                         int max_context, int num_threads) {
+    activation_buffers *b = (activation_buffers *)calloc(1, sizeof(activation_buffers));
+    if (!b) return NULL;
+    size_t hs = cfg->hidden_size, is = cfg->intermediate_size;
+    size_t q_size = (size_t)cfg->num_heads * cfg->head_dim;
+    size_t kv_size = (size_t)cfg->num_kv_heads * cfg->head_dim;
+    b->cap = cap;
+    b->x = (float *)malloc(cap * hs * sizeof(float));
+    b->xn = (float *)malloc(cap * hs * sizeof(float));
+    b->q = (float *)malloc(cap * q_size * sizeof(float));
+    b->k = (float *)malloc(cap * kv_size * sizeof(float));
+    b->v = (float *)malloc(cap * kv_size * sizeof(float));
+    b->attn = (float *)malloc(cap * q_size * sizeof(float));
+    b->proj = (float *)malloc(cap * hs * sizeof(float));
+    b->gate = (float *)malloc(cap * is * sizeof(float));
+    b->up = (float *)malloc(cap * is * sizeof(float));
+    b->score_stride = max_context;
+    b->scores = (float *)malloc((size_t)num_threads * max_context * sizeof(float));
+    if (!b->x || !b->xn || !b->q || !b->k || !b->v || !b->attn || !b->proj ||
+        !b->gate || !b->up || !b->scores) {
+        free_buffers(b);
+        return NULL;
+    }
+    return b;
+}
+
+/* ============================================================================
+ * Transformer Context
+ * ========================================================================== */
+
+struct gemma3_transformer {
     gemma3_weights_t *weights;
     gemma3_kv_cache *cache;
     activation_buffers *buffers;
     gemma3_config config;
-    float *rope_freqs_local;   /* [max_context, head_dim/2, 2] cos/sin for theta=10000 */
-    float *rope_freqs_global;  /* [max_context, head_dim/2, 2] cos/sin for theta=1000000 */
-#ifdef USE_THREADS
-    gemma3_thread_pool *thread_pool;
-#endif
+    int max_context;
+    float *rope_freqs_local;   /* [max_context, head_dim/2, 2] cos/sin, theta=10K */
+    float *rope_freqs_global;  /* [max_context, head_dim/2, 2] cos/sin, theta=1M, scaled */
+    gemma3_thread_pool *pool;
+    const volatile int *abort_flag;
 #ifdef USE_MPS
     gemma3_metal_context *metal_ctx;
 #endif
-} gemma3_transformer;
+};
+
+/* ============================================================================
+ * Parallel helpers
+ * ========================================================================== */
+
+/* Several independent projections that share the same input, run as one
+ * parallel job (Q/K/V and gate/up). Rows of the outputs are concatenated
+ * into a single index space for scheduling. */
+typedef struct {
+    int count;
+    const uint16_t *W[3];
+    float *Y[3];
+    int M[3];
+    int K;
+    const float *X;
+    int N;
+} multi_proj_task;
+
+static void multi_proj_fn(void *arg, int start, int end) {
+    multi_proj_task *t = (multi_proj_task *)arg;
+    int base = 0;
+    for (int i = 0; i < t->count && start < end; i++) {
+        int lo = start - base, hi = end - base;
+        if (lo < t->M[i] && hi > 0) {
+            if (lo < 0) lo = 0;
+            if (hi > t->M[i]) hi = t->M[i];
+            if (t->N == 1) {
+                gemma3_matvec_bf16_range(t->Y[i], t->W[i], t->X, lo, hi, t->K);
+            } else {
+                const int NB = 32;
+                for (int n0 = 0; n0 < t->N; n0 += NB) {
+                    int nb = t->N - n0 < NB ? t->N - n0 : NB;
+                    gemma3_matmul_bf16_range(t->Y[i] + (size_t)n0 * t->M[i], t->M[i],
+                                             t->X + (size_t)n0 * t->K, nb,
+                                             t->W[i], t->K, lo, hi);
+                }
+            }
+        }
+        base += t->M[i];
+    }
+}
+
+static void run_projections(gemma3_thread_pool *pool, multi_proj_task *t) {
+    int total = 0;
+    for (int i = 0; i < t->count; i++) total += t->M[i];
+    int nt = gemma3_thread_pool_size(pool);
+    /* Chunks are multiples of 16 rows so they never straddle two matrices
+     * (all Gemma projection sizes are multiples of 16) and keep the 4-row
+     * kernels fully busy. */
+    int chunk = total / (nt * 8);
+    if (chunk < 16) chunk = 16;
+    chunk = (chunk + 15) & ~15;
+    gemma3_parallel_for(pool, total, chunk, multi_proj_fn, t);
+}
+
+static void project(gemma3_thread_pool *pool, float *Y, const float *X, int N,
+                    const uint16_t *W, int M, int K) {
+    multi_proj_task t = { 1, { W, NULL, NULL }, { Y, NULL, NULL }, { M, 0, 0 }, K, X, N };
+    run_projections(pool, &t);
+}
+
+/* Per-token RMSNorm over rows of a [N, n] matrix (optionally adding the
+ * result into a residual stream). */
+typedef struct {
+    float *dst;            /* output rows (may equal src) */
+    const float *src;
+    float *residual;       /* if non-NULL: residual += normalized */
+    const uint16_t *weight;
+    int n;
+    float eps;
+} rows_norm_task;
+
+static void rows_norm_fn(void *arg, int start, int end) {
+    rows_norm_task *t = (rows_norm_task *)arg;
+    for (int i = start; i < end; i++) {
+        float *d = t->dst + (size_t)i * t->n;
+        gemma3_rmsnorm_bf16(d, t->src + (size_t)i * t->n, t->weight, t->n, t->eps);
+        if (t->residual) {
+            float *r = t->residual + (size_t)i * t->n;
+            for (int j = 0; j < t->n; j++) r[j] += d[j];
+        }
+    }
+}
+
+static void rows_norm(gemma3_thread_pool *pool, float *dst, const float *src, float *residual,
+                      const uint16_t *weight, int N, int n, float eps) {
+    rows_norm_task t = { dst, src, residual, weight, n, eps };
+    gemma3_parallel_for(N > 1 ? pool : NULL, N, 1, rows_norm_fn, &t);
+}
+
+typedef struct {
+    float *gate;
+    const float *up;
+} gelu_task;
+
+static void gelu_fn(void *arg, int start, int end) {
+    gelu_task *t = (gelu_task *)arg;
+    gemma3_gelu_tanh_mul(t->gate + start, t->up + start, end - start);
+}
+
+/* Attention for every (token, head) pair of a chunk */
+typedef struct {
+    const gemma3_config *cfg;
+    const layer_kv_cache *lc;
+    const float *q;       /* [N, q_size] */
+    float *out;           /* [N, q_size] */
+    float *scores;        /* [num_threads, score_stride] */
+    int score_stride;
+    int N;
+    int start_pos;
+    int is_global;
+    atomic_int next;
+} attn_task;
+
+static void attn_worker(void *arg, int thread_idx, int num_threads) {
+    (void)num_threads;
+    attn_task *t = (attn_task *)arg;
+    const gemma3_config *cfg = t->cfg;
+    int hd = cfg->head_dim;
+    int nh = cfg->num_heads;
+    int heads_per_kv = cfg->num_heads / cfg->num_kv_heads;
+    int kv_stride = cfg->num_kv_heads * hd;
+    int q_size = nh * hd;
+    float scale = 1.0f / sqrtf((float)hd);  /* query_pre_attn_scalar = head_dim */
+    float *scores = t->scores + (size_t)thread_idx * t->score_stride;
+    int total = t->N * nh;
+
+    for (;;) {
+        int item = atomic_fetch_add_explicit(&t->next, 1, memory_order_relaxed);
+        if (item >= total) break;
+        int i = item / nh, h = item % nh;
+        int pos = t->start_pos + i;
+        int lo = t->is_global ? 0 : pos - cfg->sliding_window + 1;
+        if (lo < 0) lo = 0;
+        int kv_head = h / heads_per_kv;
+        gemma3_attention_head(t->out + (size_t)i * q_size + h * hd,
+                              t->q + (size_t)i * q_size + h * hd,
+                              t->lc->k + kv_head * hd, t->lc->v + kv_head * hd,
+                              kv_stride, lo, pos, t->lc->ring, hd, scale, scores);
+    }
+}
+
+/* ============================================================================
+ * Forward pass for one chunk of tokens (CPU)
+ * ========================================================================== */
+
+static void forward_chunk(gemma3_transformer *t, const int *tokens, int N,
+                          int start_pos, float *logits) {
+    const gemma3_config *cfg = &t->config;
+    const gemma3_weights_t *w = t->weights;
+    activation_buffers *b = t->buffers;
+    gemma3_thread_pool *pool = t->pool;
+
+    const int hs = cfg->hidden_size;
+    const int is = cfg->intermediate_size;
+    const int hd = cfg->head_dim;
+    const int nh = cfg->num_heads;
+    const int nkv = cfg->num_kv_heads;
+    const int q_size = nh * hd;
+    const int kv_size = nkv * hd;
+    const float eps = cfg->rmsnorm_eps;
+
+    /* Embedding lookup, scaled by sqrt(hidden_size) */
+    const float embed_scale = sqrtf((float)hs);
+    for (int i = 0; i < N; i++) {
+        float *xi = b->x + (size_t)i * hs;
+        gemma3_embed_bf16(xi, w->embed_tokens, tokens[i], hs);
+        for (int j = 0; j < hs; j++) xi[j] *= embed_scale;
+    }
+
+    for (int l = 0; l < cfg->num_layers; l++) {
+        const int is_global = gemma3_is_global_layer(l);
+        const float *rope = is_global ? t->rope_freqs_global : t->rope_freqs_local;
+        layer_kv_cache *lc = &t->cache->layers[l];
+
+        /* ---- Attention block ---- */
+        rows_norm(pool, b->xn, b->x, NULL, w->layers[l].input_layernorm, N, hs, eps);
+
+        multi_proj_task qkv = {
+            3,
+            { w->layers[l].q_proj, w->layers[l].k_proj, w->layers[l].v_proj },
+            { b->q, b->k, b->v },
+            { q_size, kv_size, kv_size },
+            hs, b->xn, N
+        };
+        run_projections(pool, &qkv);
+
+        /* QK-norm, RoPE, and append K/V to the cache for every token */
+        for (int i = 0; i < N; i++) {
+            int pos = start_pos + i;
+            float *qi = b->q + (size_t)i * q_size;
+            float *ki = b->k + (size_t)i * kv_size;
+            for (int h = 0; h < nh; h++) {
+                gemma3_rmsnorm_bf16(qi + h * hd, qi + h * hd, w->layers[l].q_norm, hd, eps);
+                gemma3_rope_apply_precomputed(qi + h * hd, rope, hd, pos);
+            }
+            for (int h = 0; h < nkv; h++) {
+                gemma3_rmsnorm_bf16(ki + h * hd, ki + h * hd, w->layers[l].k_norm, hd, eps);
+                gemma3_rope_apply_precomputed(ki + h * hd, rope, hd, pos);
+            }
+            size_t row = (size_t)(lc->ring > 0 ? pos % lc->ring : pos);
+            memcpy(lc->k + row * kv_size, ki, (size_t)kv_size * sizeof(float));
+            memcpy(lc->v + row * kv_size, b->v + (size_t)i * kv_size, (size_t)kv_size * sizeof(float));
+        }
+
+        attn_task at;
+        at.cfg = cfg;
+        at.lc = lc;
+        at.q = b->q;
+        at.out = b->attn;
+        at.scores = b->scores;
+        at.score_stride = b->score_stride;
+        at.N = N;
+        at.start_pos = start_pos;
+        at.is_global = is_global;
+        atomic_init(&at.next, 0);
+        /* Short contexts are cheaper to run inline than to dispatch */
+        int span = start_pos + N;
+        if (!is_global && span > cfg->sliding_window) span = cfg->sliding_window;
+        if ((long)N * nh * span >= 4096) {
+            gemma3_thread_pool_run(pool, attn_worker, &at);
+        } else {
+            attn_worker(&at, 0, 1);
+        }
+
+        project(pool, b->proj, b->attn, N, w->layers[l].o_proj, hs, q_size);
+
+        /* x += post_attention_norm(proj) */
+        rows_norm(pool, b->proj, b->proj, b->x, w->layers[l].post_attention_layernorm, N, hs, eps);
+
+        /* ---- MLP block ---- */
+        rows_norm(pool, b->xn, b->x, NULL, w->layers[l].pre_feedforward_layernorm, N, hs, eps);
+
+        multi_proj_task gu = {
+            2,
+            { w->layers[l].gate_proj, w->layers[l].up_proj, NULL },
+            { b->gate, b->up, NULL },
+            { is, is, 0 },
+            hs, b->xn, N
+        };
+        run_projections(pool, &gu);
+
+        gelu_task gt = { b->gate, b->up };
+        gemma3_parallel_for(N > 1 ? pool : NULL, N * is, 4096, gelu_fn, &gt);
+
+        project(pool, b->proj, b->gate, N, w->layers[l].down_proj, hs, is);
+
+        /* x += post_feedforward_norm(mlp_out) */
+        rows_norm(pool, b->proj, b->proj, b->x, w->layers[l].post_feedforward_layernorm, N, hs, eps);
+    }
+
+    if (logits) {
+        /* Final norm + tied-embedding output projection for the last token */
+        float *last = b->x + (size_t)(N - 1) * hs;
+        gemma3_rmsnorm_bf16(b->xn, last, w->norm, hs, eps);
+        gemma3_matvec_bf16_mt(logits, w->embed_tokens, b->xn, cfg->vocab_size, hs, NULL, pool);
+    }
+}
+
+/* ============================================================================
+ * Internal API (see gemma3_internal.h)
+ * ========================================================================== */
 
 gemma3_transformer *gemma3_transformer_create(
     gemma3_weights_t *weights,
@@ -822,56 +426,42 @@ gemma3_transformer *gemma3_transformer_create(
 
     t->weights = weights;
     t->config = *cfg;
+    t->max_context = max_context;
 
-    t->cache = gemma3_kv_cache_alloc(cfg, max_context);
-    if (!t->cache) {
-        free(t);
-        return NULL;
-    }
+    t->pool = gemma3_thread_pool_create(num_threads);
+    t->cache = kv_cache_alloc(cfg, max_context);
+    int nthreads = gemma3_thread_pool_size(t->pool);
+    t->buffers = alloc_buffers(cfg, GEMMA3_PREFILL_CHUNK, max_context, nthreads);
 
-    t->buffers = alloc_buffers(cfg);
-    if (!t->buffers) {
-        gemma3_kv_cache_free(t->cache);
-        free(t);
-        return NULL;
-    }
-
-    /* Precompute RoPE cos/sin tables for local and global theta */
-    int rope_table_size = max_context * (cfg->head_dim / 2) * 2;
+    size_t rope_table_size = (size_t)max_context * (cfg->head_dim / 2) * 2;
     t->rope_freqs_local = (float *)malloc(rope_table_size * sizeof(float));
     t->rope_freqs_global = (float *)malloc(rope_table_size * sizeof(float));
-    if (!t->rope_freqs_local || !t->rope_freqs_global) {
-        free(t->rope_freqs_local);
-        free(t->rope_freqs_global);
-        free_buffers(t->buffers);
-        gemma3_kv_cache_free(t->cache);
-        free(t);
+
+    if (!t->pool || !t->cache || !t->buffers || !t->rope_freqs_local || !t->rope_freqs_global) {
+        gemma3_transformer_destroy(t);
         return NULL;
     }
+
     gemma3_rope_precompute(t->rope_freqs_local, max_context, cfg->head_dim,
                            cfg->rope_theta_local, 1.0f);
     gemma3_rope_precompute(t->rope_freqs_global, max_context, cfg->head_dim,
                            cfg->rope_theta_global, cfg->rope_scale_global);
 
-#ifdef USE_THREADS
-    t->thread_pool = gemma3_thread_pool_create(num_threads); /* <= 0: auto-detect */
-#endif
-
 #ifdef USE_MPS
-    t->metal_ctx = gemma3_metal_init(cfg, max_context);
-    if (t->metal_ctx) {
-        if (gemma3_metal_upload_weights(t->metal_ctx, t->weights) != 0 ||
-            gemma3_metal_upload_rope(t->metal_ctx, t->rope_freqs_local,
-                                     t->rope_freqs_global, max_context,
-                                     cfg->head_dim) != 0) {
-            fprintf(stderr, "Metal: weight/rope upload failed, falling back to CPU\n");
-            gemma3_metal_free(t->metal_ctx);
-            t->metal_ctx = NULL;
+    if (!getenv("GEMMA3_NO_METAL")) {
+        t->metal_ctx = gemma3_metal_init(cfg, max_context);
+        if (t->metal_ctx) {
+            if (gemma3_metal_upload_weights(t->metal_ctx, t->weights) != 0 ||
+                gemma3_metal_upload_rope(t->metal_ctx, t->rope_freqs_local,
+                                         t->rope_freqs_global, max_context,
+                                         cfg->head_dim) != 0) {
+                fprintf(stderr, "Metal: weight/rope upload failed, falling back to CPU\n");
+                gemma3_metal_free(t->metal_ctx);
+                t->metal_ctx = NULL;
+            }
         } else {
-            fprintf(stderr, "Metal GPU acceleration enabled\n");
+            fprintf(stderr, "Metal GPU not available, using CPU\n");
         }
-    } else {
-        fprintf(stderr, "Metal GPU not available, using CPU\n");
     }
 #endif
 
@@ -883,74 +473,90 @@ void gemma3_transformer_destroy(gemma3_transformer *t) {
 #ifdef USE_MPS
     if (t->metal_ctx) gemma3_metal_free(t->metal_ctx);
 #endif
-#ifdef USE_THREADS
-    gemma3_thread_pool_destroy(t->thread_pool);
-#endif
-    gemma3_kv_cache_free(t->cache);
+    gemma3_thread_pool_destroy(t->pool);
+    kv_cache_free(t->cache);
     free_buffers(t->buffers);
     free(t->rope_freqs_local);
     free(t->rope_freqs_global);
     free(t);
 }
 
-int gemma3_transformer_forward_token(
-    gemma3_transformer *t,
-    int token_id,
-    int pos,
-    float *logits
-) {
-#ifdef USE_MPS
-    if (t->metal_ctx) {
-        return gemma3_metal_forward_token(t->metal_ctx, token_id, pos, logits, 1);
-    }
-#endif
-    void *pool = NULL;
-#ifdef USE_THREADS
-    pool = t->thread_pool;
-#endif
-    return gemma3_transformer_forward(
-        logits, token_id, pos,
-        t->weights, t->cache, t->buffers, &t->config, 1,
-        t->rope_freqs_local, t->rope_freqs_global, pool
-    );
+void gemma3_transformer_set_abort_flag(gemma3_transformer *t, const volatile int *flag) {
+    if (t) t->abort_flag = flag;
 }
 
-int gemma3_transformer_prefill_tokens(
-    gemma3_transformer *t,
-    const int *tokens,
-    int num_tokens,
-    int start_pos,
-    float *logits
-) {
+int gemma3_transformer_forward_token(gemma3_transformer *t, int token_id, int pos,
+                                     float *logits) {
+    if (!t || pos < 0 || pos >= t->max_context) return GEMMA3_ERR_CONTEXT_OVERFLOW;
+    if (token_id < 0 || token_id >= t->config.vocab_size) return GEMMA3_ERR_INVALID_ARG;
 #ifdef USE_MPS
     if (t->metal_ctx) {
-        return gemma3_metal_prefill(t->metal_ctx, tokens, num_tokens, start_pos, logits);
+        int ret = gemma3_metal_forward_token(t->metal_ctx, token_id, pos, logits, logits != NULL);
+        if (ret == 0) t->cache->current_pos = pos + 1;
+        return ret;
     }
 #endif
-    void *pool = NULL;
-#ifdef USE_THREADS
-    pool = t->thread_pool;
+    forward_chunk(t, &token_id, 1, pos, logits);
+    t->cache->current_pos = pos + 1;
+    return 0;
+}
+
+int gemma3_transformer_prefill_tokens(gemma3_transformer *t, const int *tokens,
+                                      int num_tokens, int start_pos, float *logits) {
+    if (!t || !tokens || num_tokens <= 0 || start_pos < 0) return GEMMA3_ERR_INVALID_ARG;
+    if (start_pos + num_tokens > t->max_context) return GEMMA3_ERR_CONTEXT_OVERFLOW;
+    for (int i = 0; i < num_tokens; i++) {
+        if (tokens[i] < 0 || tokens[i] >= t->config.vocab_size) return GEMMA3_ERR_INVALID_ARG;
+    }
+
+#ifdef USE_MPS
+    if (t->metal_ctx) {
+        /* Feed the Metal backend in slices so long prompts can be interrupted */
+        for (int done = 0; done < num_tokens; ) {
+            if (t->abort_flag && *t->abort_flag) return GEMMA3_ERR_ABORTED;
+            int n = num_tokens - done;
+            if (n > GEMMA3_PREFILL_CHUNK * 4) n = GEMMA3_PREFILL_CHUNK * 4;
+            int last = (done + n == num_tokens);
+            int ret = gemma3_metal_prefill(t->metal_ctx, tokens + done, n, start_pos + done,
+                                           last ? logits : NULL);
+            if (ret != 0) return ret;
+            done += n;
+            t->cache->current_pos = start_pos + done;
+        }
+        return 0;
+    }
 #endif
-    return gemma3_transformer_prefill(
-        logits, tokens, num_tokens, start_pos,
-        t->weights, t->cache, t->buffers, &t->config,
-        t->rope_freqs_local, t->rope_freqs_global, pool
-    );
+
+    for (int done = 0; done < num_tokens; ) {
+        if (t->abort_flag && *t->abort_flag) return GEMMA3_ERR_ABORTED;
+        int n = num_tokens - done;
+        if (n > GEMMA3_PREFILL_CHUNK) n = GEMMA3_PREFILL_CHUNK;
+        int last = (done + n == num_tokens);
+        forward_chunk(t, tokens + done, n, start_pos + done, last ? logits : NULL);
+        done += n;
+        t->cache->current_pos = start_pos + done;
+    }
+    return 0;
 }
 
 void gemma3_transformer_reset(gemma3_transformer *t) {
-    if (t && t->cache) {
-        gemma3_kv_cache_reset(t->cache);
-    }
+    if (!t) return;
+    if (t->cache) t->cache->current_pos = 0;
 #ifdef USE_MPS
-    if (t && t->metal_ctx) {
-        gemma3_metal_reset_cache(t->metal_ctx);
-    }
+    if (t->metal_ctx) gemma3_metal_reset_cache(t->metal_ctx);
 #endif
 }
 
 int gemma3_transformer_get_pos(gemma3_transformer *t) {
     return t && t->cache ? t->cache->current_pos : 0;
+}
+
+int gemma3_transformer_can_rewind(const gemma3_transformer *t, int from_pos, int to_pos) {
+    if (!t || to_pos < 0 || to_pos > from_pos) return 0;
+    /* Safe if no local ring has wrapped yet, or if the rewind is short enough
+     * that every row a future query needs is still intact. */
+    int ring = gemma3_local_ring_size(t->config.sliding_window);
+    return from_pos <= ring || from_pos - to_pos <= GEMMA3_LOCAL_RING_EXTRA + 1;
 }
 
 const char *gemma3_transformer_backend(const gemma3_transformer *t) {
@@ -962,9 +568,5 @@ const char *gemma3_transformer_backend(const gemma3_transformer *t) {
 }
 
 int gemma3_transformer_num_threads(const gemma3_transformer *t) {
-#ifdef USE_THREADS
-    if (t && t->thread_pool) return gemma3_thread_pool_size(t->thread_pool);
-#endif
-    (void)t;
-    return 1;
+    return t ? gemma3_thread_pool_size(t->pool) : 1;
 }
