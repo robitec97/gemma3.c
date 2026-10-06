@@ -16,9 +16,10 @@ does (float32 math), without depending on torch or on any of the C code:
   * gelu(tanh) gated MLP, pre/post attention and pre/post feed-forward norms
   * final norm and tied lm_head (embed_tokens), no logit soft-capping
 
-Weights are read straight from the safetensors files with np.memmap and
-converted from BF16 to float32 one layer at a time, so peak memory stays
-around 1-2 GB plus activations.
+Weights are read straight from the safetensors files (np.fromfile, so they
+stay in the OS page cache rather than this process) and converted from BF16
+to float32 one layer at a time, so peak RSS stays around 1-2 GB plus
+activations.
 
 Usage:
   python tools/reference_forward.py -m gemma-3-4b-it --ids 2,9259,236764,1902
@@ -50,7 +51,11 @@ import numpy as np
 # ----------------------------------------------------------------------------
 
 class SafeTensors:
-    """Minimal multi-file safetensors reader backed by np.memmap."""
+    """Minimal multi-file safetensors reader.
+
+    Tensors are read with np.fromfile rather than np.memmap so that weight
+    pages live in the OS page cache instead of this process's resident set
+    (keeps peak RSS around 1-2 GB even though every weight is touched)."""
 
     _DTYPES = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}
 
@@ -64,30 +69,44 @@ class SafeTensors:
             with open(path, "rb") as f:
                 (header_len,) = struct.unpack("<Q", f.read(8))
                 header = json.loads(f.read(header_len))
-            mm = np.memmap(path, dtype=np.uint8, mode="r")
             data_start = 8 + header_len
             for name, info in header.items():
                 if name == "__metadata__":
                     continue
                 begin, end = info["data_offsets"]
-                self.tensors[name] = (mm, info["dtype"], tuple(info["shape"]),
+                self.tensors[name] = (path, info["dtype"], tuple(info["shape"]),
                                       data_start + begin, end - begin)
 
     def __contains__(self, name):
         return name in self.tensors
 
-    def raw(self, name):
-        mm, dtype, shape, offset, nbytes = self.tensors[name]
-        np_dtype = self._DTYPES[dtype]
-        count = nbytes // np.dtype(np_dtype).itemsize
-        arr = np.frombuffer(mm, dtype=np_dtype, count=count, offset=offset)
-        return arr.reshape(shape), dtype
+    def shape(self, name):
+        return self.tensors[name][2]
+
+    def _read(self, name, rows=None):
+        path, dtype, shape, offset, nbytes = self.tensors[name]
+        np_dtype = np.dtype(self._DTYPES[dtype])
+        row_elems = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+        row_bytes = row_elems * np_dtype.itemsize
+        with open(path, "rb") as f:
+            if rows is None:
+                f.seek(offset)
+                return np.fromfile(f, dtype=np_dtype, count=nbytes // np_dtype.itemsize
+                                   ).reshape(shape), dtype
+            if isinstance(rows, slice):
+                r0, r1, _ = rows.indices(shape[0])
+                f.seek(offset + r0 * row_bytes)
+                arr = np.fromfile(f, dtype=np_dtype, count=(r1 - r0) * row_elems)
+                return arr.reshape((r1 - r0,) + tuple(shape[1:])), dtype
+            out = np.empty((len(rows),) + tuple(shape[1:]), dtype=np_dtype)
+            for j, r in enumerate(rows):
+                f.seek(offset + int(r) * row_bytes)
+                out[j] = np.fromfile(f, dtype=np_dtype, count=row_elems).reshape(shape[1:])
+            return out, dtype
 
     def get(self, name, dtype=np.float32, rows=None):
-        """Load a tensor (optionally a subset of rows) converted to `dtype`."""
-        arr, st_dtype = self.raw(name)
-        if rows is not None:
-            arr = arr[rows]
+        """Load a tensor (optionally a slice or list of rows) converted to `dtype`."""
+        arr, st_dtype = self._read(name, rows)
         if st_dtype == "BF16":
             out = (arr.astype(np.uint32) << 16).view(np.float32)
         else:
@@ -244,8 +263,7 @@ def forward(model_dir, ids, rope_scaling=True, bf16_embed_scale=False,
     # --- final norm + tied lm_head, computed in row chunks of the embedding ---
     final = x if all_positions else x[-1:]
     final = rms_norm(final, st.get(pre + "norm.weight", dtype), eps)
-    embed_raw, _ = st.raw(pre + "embed_tokens.weight")
-    vocab = embed_raw.shape[0]
+    vocab = st.shape(pre + "embed_tokens.weight")[0]
     logits = np.empty((final.shape[0], vocab), dtype=np.float32)
     chunk = 16384
     for r0 in range(0, vocab, chunk):
