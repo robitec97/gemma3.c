@@ -178,8 +178,9 @@ gemma3_sampler *gemma3_sampler_create(int vocab_size);
 void gemma3_sampler_free(gemma3_sampler *s);
 
 /* Pick the next token from raw logits.
- * temperature <= 0 means greedy. top_k <= 0 disables top-k, top_p >= 1 disables
- * top-p, min_p <= 0 disables min-p. Only the surviving candidates are sorted and
+ * temperature <= 0 (or non-finite) means greedy. top_k <= 0 disables top-k,
+ * top_p >= 1 disables top-p (top_p <= 0 keeps only the best token), min_p <= 0
+ * disables min-p. NaN logits are never sampled. Only the surviving candidates are sorted and
  * softmaxed, so the cost is O(vocab) for the scan plus O(k log k).
  * rng_state is advanced (xorshift64*); pass a pointer to a per-context state. */
 int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,

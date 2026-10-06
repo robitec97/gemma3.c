@@ -104,7 +104,8 @@ typedef struct gemma3_transformer gemma3_transformer;
 
 gemma3_transformer *gemma3_transformer_create(gemma3_weights_t *weights,
                                                const gemma3_config *cfg,
-                                               int max_context, int num_threads);
+                                               int max_context, int num_threads,
+                                               int use_gpu);
 void gemma3_transformer_destroy(gemma3_transformer *t);
 int gemma3_transformer_forward_token(gemma3_transformer *t, int token_id,
                                       int pos, float *logits);
@@ -119,9 +120,9 @@ int gemma3_transformer_num_threads(const gemma3_transformer *t);
  * GEMMA3_ERR_ABORTED when it becomes non-zero. */
 void gemma3_transformer_set_abort_flag(gemma3_transformer *t, const volatile int *flag);
 
-/* Whether the KV cache, filled up to from_pos, can be rewound to to_pos and
- * extended from there (local layers keep only a ring of recent positions). */
-int gemma3_transformer_can_rewind(const gemma3_transformer *t, int from_pos, int to_pos);
+/* Whether generation can continue from position to_pos, reusing the cached
+ * K/V for [0, to_pos) (local layers keep only a ring of recent positions). */
+int gemma3_transformer_can_rewind(const gemma3_transformer *t, int to_pos);
 
 #ifdef __cplusplus
 }

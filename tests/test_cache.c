@@ -110,6 +110,25 @@ int main(int argc, char **argv) {
     expect_same("unrelated prompt (no reuse expected)", fresh, reused, 0, 0);
     if (r != 0) { printf("  FAIL expected no reuse, got %d\n", r); failures++; }
 
+    /* 5. Two rewinds in a row: the second one must not trust ring rows that
+     *    were overwritten before the first rewind (high-water mark) */
+    int *a2 = malloc((size_t)(L + 64) * sizeof(int));
+    int *a3 = malloc((size_t)(L + 64) * sizeof(int));
+    memcpy(a2, prompt, (size_t)(L + 64) * sizeof(int));
+    memcpy(a3, prompt, (size_t)(L + 64) * sizeof(int));
+    a2[1080] = 3000;                                    /* A[:1080] + x */
+    a3[50] = 3001;                                      /* A[:50] + y   */
+    gemma3_reset_cache(ctx);
+    generate(ctx, a3, 51, N, fresh);
+    gemma3_reset_cache(ctx);
+    generate(ctx, prompt, 1200, 1, reused);             /* ring wraps at 1152 */
+    generate(ctx, a2, 1081, 1, reused);                 /* rewind 120: allowed */
+    generate(ctx, a3, 51, N, reused);                   /* must recompute */
+    expect_same("second rewind after an earlier rewind", fresh, reused,
+                gemma3_get_stats(ctx)->reused_tokens, 0);
+    free(a2);
+    free(a3);
+
     free(prompt);
     free(alt);
     gemma3_free(ctx);

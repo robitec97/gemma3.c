@@ -156,6 +156,7 @@ struct gemma3_transformer {
     float *rope_freqs_local;   /* [max_context, head_dim/2, 2] cos/sin, theta=10K */
     float *rope_freqs_global;  /* [max_context, head_dim/2, 2] cos/sin, theta=1M, scaled */
     gemma3_thread_pool *pool;
+    int high_water;            /* highest position + 1 written since the last reset */
     float *blas_scratch;       /* F32 copy of one weight matrix (BLAS builds) */
     const volatile int *abort_flag;
 #ifdef USE_MPS
@@ -456,7 +457,8 @@ gemma3_transformer *gemma3_transformer_create(
     gemma3_weights_t *weights,
     const gemma3_config *cfg,
     int max_context,
-    int num_threads
+    int num_threads,
+    int use_gpu
 ) {
     gemma3_transformer *t = (gemma3_transformer *)calloc(1, sizeof(gemma3_transformer));
     if (!t) return NULL;
@@ -496,7 +498,7 @@ gemma3_transformer *gemma3_transformer_create(
                            cfg->rope_theta_global, cfg->rope_scale_global);
 
 #ifdef USE_MPS
-    if (!getenv("GEMMA3_NO_METAL")) {
+    if (use_gpu && !getenv("GEMMA3_NO_METAL")) {
         t->metal_ctx = gemma3_metal_init(cfg, max_context);
         if (t->metal_ctx) {
             if (gemma3_metal_upload_weights(t->metal_ctx, t->weights) != 0 ||
@@ -511,6 +513,8 @@ gemma3_transformer *gemma3_transformer_create(
             fprintf(stderr, "Metal GPU not available, using CPU\n");
         }
     }
+#else
+    (void)use_gpu;
 #endif
 
     return t;
@@ -540,11 +544,13 @@ int gemma3_transformer_forward_token(gemma3_transformer *t, int token_id, int po
     if (token_id < 0 || token_id >= t->config.vocab_size) return GEMMA3_ERR_INVALID_ARG;
 #ifdef USE_MPS
     if (t->metal_ctx) {
+        if (pos + 1 > t->high_water) t->high_water = pos + 1;
         int ret = gemma3_metal_forward_token(t->metal_ctx, token_id, pos, logits, logits != NULL);
         if (ret == 0) t->cache->current_pos = pos + 1;
         return ret;
     }
 #endif
+    if (pos + 1 > t->high_water) t->high_water = pos + 1;
     forward_chunk(t, &token_id, 1, pos, logits);
     t->cache->current_pos = pos + 1;
     return 0;
@@ -566,6 +572,7 @@ int gemma3_transformer_prefill_tokens(gemma3_transformer *t, const int *tokens,
             int n = num_tokens - done;
             if (n > GEMMA3_PREFILL_CHUNK * 4) n = GEMMA3_PREFILL_CHUNK * 4;
             int last = (done + n == num_tokens);
+            if (start_pos + done + n > t->high_water) t->high_water = start_pos + done + n;
             int ret = gemma3_metal_prefill(t->metal_ctx, tokens + done, n, start_pos + done,
                                            last ? logits : NULL);
             if (ret != 0) return ret;
@@ -581,6 +588,7 @@ int gemma3_transformer_prefill_tokens(gemma3_transformer *t, const int *tokens,
         int n = num_tokens - done;
         if (n > GEMMA3_PREFILL_CHUNK) n = GEMMA3_PREFILL_CHUNK;
         int last = (done + n == num_tokens);
+        if (start_pos + done + n > t->high_water) t->high_water = start_pos + done + n;
         forward_chunk(t, tokens + done, n, start_pos + done, last ? logits : NULL);
         done += n;
         t->cache->current_pos = start_pos + done;
@@ -591,6 +599,7 @@ int gemma3_transformer_prefill_tokens(gemma3_transformer *t, const int *tokens,
 void gemma3_transformer_reset(gemma3_transformer *t) {
     if (!t) return;
     if (t->cache) t->cache->current_pos = 0;
+    t->high_water = 0;
 #ifdef USE_MPS
     if (t->metal_ctx) gemma3_metal_reset_cache(t->metal_ctx);
 #endif
@@ -600,12 +609,16 @@ int gemma3_transformer_get_pos(gemma3_transformer *t) {
     return t && t->cache ? t->cache->current_pos : 0;
 }
 
-int gemma3_transformer_can_rewind(const gemma3_transformer *t, int from_pos, int to_pos) {
-    if (!t || to_pos < 0 || to_pos > from_pos) return 0;
-    /* Safe if no local ring has wrapped yet, or if the rewind is short enough
-     * that every row a future query needs is still intact. */
+int gemma3_transformer_can_rewind(const gemma3_transformer *t, int to_pos) {
+    if (!t || to_pos < 0) return 0;
+    /* Local layers keep a ring of R = window + EXTRA rows. Continuing from
+     * to_pos needs positions [to_pos - window + 1, to_pos) intact; position r
+     * was overwritten if some position >= r + R was ever written. Use the
+     * highest position written since the last reset (not the current fill
+     * level, which an earlier rewind may have lowered). */
     int ring = gemma3_local_ring_size(t->config.sliding_window);
-    return from_pos <= ring || from_pos - to_pos <= GEMMA3_LOCAL_RING_EXTRA + 1;
+    int hw = t->high_water;
+    return hw <= ring || hw - to_pos <= GEMMA3_LOCAL_RING_EXTRA + 1;
 }
 
 const char *gemma3_transformer_backend(const gemma3_transformer *t) {

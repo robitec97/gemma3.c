@@ -575,7 +575,8 @@ static const uint16_t *load_weight_bf16(st_context *st, const char *prefix,
                 "are supported\n", full, info->dtype);
         return NULL;
     }
-    if (expected_numel > 0 && st_tensor_numel(info) != expected_numel) {
+    if (expected_numel > 0 && (st_tensor_numel(info) != expected_numel ||
+                               info->data_size != expected_numel * 2)) {
         fprintf(stderr, "Error: tensor '%s' has %lld elements, expected %lld "
                 "(is this a Gemma 3 4B checkpoint?)\n", full,
                 (long long)st_tensor_numel(info), (long long)expected_numel);

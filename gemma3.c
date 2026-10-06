@@ -201,10 +201,9 @@ gemma3_ctx *gemma3_load_dir_opts(const char *model_dir, const gemma3_load_option
     if (opts.verbose) {
         fprintf(stderr, "Initializing transformer (max context: %d)...\n", ctx->max_context);
     }
-    /* The Metal backend honours GEMMA3_NO_METAL; map use_gpu=0 onto it. */
-    if (!opts.use_gpu) setenv("GEMMA3_NO_METAL", "1", 1);
     ctx->transformer = gemma3_transformer_create(ctx->weights, &ctx->config,
-                                                 ctx->max_context, opts.num_threads);
+                                                 ctx->max_context, opts.num_threads,
+                                                 opts.use_gpu);
     if (!ctx->transformer) {
         set_error("Failed to create transformer (out of memory for context %d?)",
                   ctx->max_context);
@@ -371,7 +370,7 @@ char *gemma3_generate_tokens(gemma3_ctx *ctx, const int *tokens, int num_tokens,
         reuse++;
     }
     if (reuse >= num_tokens) reuse = num_tokens - 1;
-    if (reuse > 0 && !gemma3_transformer_can_rewind(ctx->transformer, ctx->n_cached, reuse)) {
+    if (reuse > 0 && !gemma3_transformer_can_rewind(ctx->transformer, reuse)) {
         reuse = 0;
     }
     if (reuse == 0) gemma3_reset_cache(ctx);

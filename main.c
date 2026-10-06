@@ -9,6 +9,7 @@
 
 #include "gemma3.h"
 #include <errno.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,7 +209,7 @@ static int parse_float(const char *opt, const char *s, float min, float max, flo
     char *end;
     errno = 0;
     float v = strtof(s, &end);
-    if (errno || end == s || *end || v < min || v > max) {
+    if (errno || end == s || *end || !isfinite(v) || v < min || v > max) {
         fprintf(stderr, "Error: %s expects a number in [%g, %g], got '%s'\n", opt, min, max, s);
         return 0;
     }
@@ -615,8 +616,9 @@ static int read_input(char **out) {
     buf[0] = '\0';
     for (;;) {
         char line[4096];
+        errno = 0;
         if (!fgets(line, sizeof(line), stdin)) {
-            if (g_interrupted || errno == EINTR) {
+            if (g_interrupted || (ferror(stdin) && errno == EINTR)) {
                 clearerr(stdin);
                 free(buf);
                 return -1;
@@ -826,6 +828,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_ctx = ctx;
+    if (g_interrupted) {          /* Ctrl+C while the model was loading */
+        gemma3_free(ctx);
+        free(owned_prompt);
+        return 130;
+    }
 
     if (!config.quiet && !debug_mode) {
         fprintf(stderr, "%sgemma3.c %s | %s | context %d | loaded in %.2f s%s\n", DIM,

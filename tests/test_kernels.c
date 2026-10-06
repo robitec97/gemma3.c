@@ -292,6 +292,26 @@ static void test_sampler(void) {
     for (int t = 0; t < 2000; t++) c0 += gemma3_sample_logits(s2, two, 2, 1.0f, 0, 1.0f, 0.6f, &st) == 0;
     CHECK(c0 == 0, "min_p kept a token below threshold (%d times)", c0);
 
+    /* degenerate parameters fall back to greedy instead of misbehaving */
+    logits[123457] = 30.0f;
+    CHECK(gemma3_sample_logits(s, logits, V, 1e-40f, 50, 0.9f, 0.0f, &st) == 123457, "tiny temperature");
+    CHECK(gemma3_sample_logits(s, logits, V, NAN, 50, 0.9f, 0.0f, &st) == 123457, "NaN temperature");
+    CHECK(gemma3_sample_logits(s, logits, V, 1.0f, 50, 0.0f, 0.0f, &st) == 123457, "top_p = 0");
+    CHECK(gemma3_sample_logits(s, logits, V, 1.0f, 50, 1.0f, 1.0f, &st) == 123457, "min_p = 1");
+    /* NaN logits are never chosen */
+    float nanl[4] = { NAN, 1.0f, NAN, 0.5f };
+    gemma3_sampler *s4 = gemma3_sampler_create(4);
+    int bad_nan = 0;
+    for (int t = 0; t < 500; t++) {
+        int id = gemma3_sample_logits(s4, nanl, 4, 1.0f, 0, 1.0f, 0.0f, &st);
+        bad_nan += (id == 0 || id == 2);
+        id = gemma3_sample_logits(s4, nanl, 4, 1.0f, 3, 1.0f, 0.0f, &st);
+        bad_nan += (id == 0 || id == 2);
+    }
+    CHECK(bad_nan == 0, "NaN logit sampled %d times", bad_nan);
+    CHECK(gemma3_argmax(nanl, 4) == 1, "argmax with NaN returned %d", gemma3_argmax(nanl, 4));
+    gemma3_sampler_free(s4);
+
     gemma3_sampler_free(s2);
     gemma3_sampler_free(s);
     free(sorted);

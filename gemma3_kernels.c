@@ -872,7 +872,9 @@ static int compare_indexed_float_desc(const void *a, const void *b) {
 int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,
                          float temperature, int top_k, float top_p, float min_p,
                          uint64_t *rng_state) {
-    if (temperature <= 0.0f || top_k == 1 || !s || vocab_size > s->vocab_size) {
+    /* Greedy for non-positive, tiny (1/T would overflow) or non-finite T */
+    if (!(temperature > 1e-6f) || !isfinite(temperature) || top_k == 1 ||
+        !s || vocab_size > s->vocab_size) {
         return gemma3_argmax(logits, vocab_size);
     }
 
@@ -884,7 +886,10 @@ int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,
     if (top_k > 0 && top_k < vocab_size) {
         /* Keep the top_k largest logits with a min-heap: O(V log k) */
         n = top_k;
-        for (int i = 0; i < n; i++) { val[i] = logits[i]; idx[i] = i; }
+        for (int i = 0; i < n; i++) {
+            val[i] = isnan(logits[i]) ? -INFINITY : logits[i];  /* NaN never wins */
+            idx[i] = i;
+        }
         for (int i = n / 2 - 1; i >= 0; i--) heap_sift_down(val, idx, n, i);
         for (int i = n; i < vocab_size; i++) {
             if (logits[i] > val[0]) {
@@ -896,7 +901,10 @@ int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,
         for (int i = 0; i < n; i++) { cand[i].value = val[i]; cand[i].index = idx[i]; }
     } else {
         n = vocab_size;
-        for (int i = 0; i < n; i++) { cand[i].value = logits[i]; cand[i].index = i; }
+        for (int i = 0; i < n; i++) {
+            cand[i].value = isnan(logits[i]) ? -INFINITY : logits[i];
+            cand[i].index = i;
+        }
     }
 
     /* Sort candidates by logit, descending (k is small in the common case) */
@@ -905,6 +913,7 @@ int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,
     /* Softmax with temperature over the candidates */
     float inv_t = 1.0f / temperature;
     float top = cand[0].value;
+    if (!isfinite(top)) return cand[0].index;   /* no usable logits */
     float total = 0.0f;
     for (int i = 0; i < n; i++) {
         float p = expf((cand[i].value - top) * inv_t);
@@ -914,7 +923,7 @@ int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,
 
     /* Nucleus (top-p): smallest prefix whose probability mass reaches top_p */
     int keep = n;
-    if (top_p > 0.0f && top_p < 1.0f) {
+    if (top_p < 1.0f) {                 /* top_p <= 0 keeps only the best token */
         float target = top_p * total, cum = 0.0f;
         for (int i = 0; i < n; i++) {
             cum += cand[i].value;
@@ -923,7 +932,7 @@ int gemma3_sample_logits(gemma3_sampler *s, const float *logits, int vocab_size,
     }
 
     /* min-p: drop tokens less likely than min_p * p(best) */
-    if (min_p > 0.0f && min_p < 1.0f) {
+    if (min_p > 0.0f) {
         float thresh = min_p * cand[0].value;
         int k = 1;
         while (k < keep && cand[k].value >= thresh) k++;
@@ -1011,9 +1020,9 @@ int gemma3_sample(const float *probs, int vocab_size) {
 
 int gemma3_argmax(const float *x, int n) {
     int max_idx = 0;
-    float max_val = x[0];
-    for (int i = 1; i < n; i++) {
-        if (x[i] > max_val) { max_val = x[i]; max_idx = i; }
+    float max_val = -INFINITY;
+    for (int i = 0; i < n; i++) {
+        if (x[i] > max_val) { max_val = x[i]; max_idx = i; }   /* NaNs never compare greater */
     }
     return max_idx;
 }
