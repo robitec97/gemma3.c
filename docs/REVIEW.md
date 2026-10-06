@@ -28,14 +28,15 @@ sliding-window handling.
 
 | Area | Before | After |
 |------|--------|-------|
-| Default `make` build | Scalar, single-threaded: **0.5 tok/s** | NEON/AVX2 with a thread pool (see the README for speeds) |
-| Tokenizer | O(n²) BPE with a `malloc` per lookup: **389 bytes/s** (a 4 KB prompt took 10.4 s) | Heap-based BPE: 3-11 MB/s |
+| Default `make` build | Scalar, single-threaded: **0.5 tok/s** generation, 0.6 tok/s prompt | NEON/AVX2 with a thread pool: 8.8 tok/s generation, 40 tok/s prompt |
+| Tokenizer | O(n²) BPE with a `malloc` per lookup: **389 bytes/s** (a 4 KB prompt took 10.4 s) | Heap-based BPE: 1-11 MB/s (a 4 KB prompt takes 1-4 ms) |
 | Sampling | Softmax and `qsort` over all 262k logits every token: 9.2 ms/token | Top-k heap, then sort and softmax over the candidates only: 0.08 ms/token |
-| CPU prefill | One token at a time (memory bound) | Batched BF16 GEMM over 128-token chunks (compute bound) |
+| CPU prefill | One token at a time (memory bound): 9.1 tok/s | Batched BF16 GEMM over 128-token chunks (compute bound): 40 tok/s native, 154 tok/s with Accelerate |
 | Multi-turn chat | Every turn re-processed the whole conversation | The KV cache is reused for the shared prefix, so only the new turn is processed |
 | Thread pool | Main thread idle, condvar wake-up per job, static row split (E-cores straggle) | Caller participates, workers spin briefly, dynamic chunked scheduling |
 | Metal weights | Copied into new buffers (~8 GB extra RAM, 2.9 s load) because tensors are rarely page-aligned | Zero-copy: the mapped safetensors files are wrapped directly |
-| Metal prefill | One command buffer and a CPU sync per token | Batched GPU kernels per chunk |
+| Metal prefill | One command buffer and a CPU sync per token: 9.6 tok/s | `simdgroup_matrix` GEMM per 128-token chunk: 287 tok/s |
+| Metal decode | One threadgroup per output row, 13 dispatches per layer: 9.5 tok/s | Multi-row matvec at ~105 GB/s, fused kernels (8 dispatches per layer): 12.8 tok/s |
 
 ## Usability
 

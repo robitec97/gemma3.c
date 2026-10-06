@@ -1,0 +1,12 @@
+{
+  "label": "this branch, make blas",
+  "version": "0.2.0",
+  "context": 4096,
+  "load_s": 0.9232,
+  "prefill": [{"tokens": 64, "seconds": 0.73700, "tok_per_s": 86.838}, {"tokens": 256, "seconds": 1.65886, "tok_per_s": 154.323}, {"tokens": 1024, "seconds": 6.90330, "tok_per_s": 148.335}],
+  "decode": {"tokens": 128, "seconds": 15.62252, "tok_per_s": 8.193},
+  "decode_at_depth": [],
+  "generate": {"tokens": 128, "seconds": 17.26577, "tok_per_s": 7.414},
+  "tokenizer_bytes_per_s": 0.0,
+  "peak_rss_mb": 8667.5
+}

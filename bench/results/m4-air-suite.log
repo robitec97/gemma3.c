@@ -1,0 +1,79 @@
+=== new-mps 23:12:16
+
+this branch, make mps  |  model: /Users/robitec/Desktop/Projects/gemma3.c/gemma-3-4b-it  |  context: 4096
+load: 4.39 s
+
+test                             tokens/s     ms/token
+---------------------------- ------------ ------------
+prefill pp64                       305.50         3.27
+prefill pp256                      287.12         3.48
+prefill pp1024                     275.91         3.62
+decode tg128                        12.82        78.03
+decode tg128 @ depth 2048           11.55        86.59
+generate (sampled) tg128             8.86       112.82   (incl. 64-token prefill)
+tokenizer (bytes/s)               1039918            -   (4064 bytes -> 722 tokens in 3.9 ms)
+
+peak RSS: 8264 MB
+=== base-mps 23:13:57
+
+original, make mps  |  model: /Users/robitec/Desktop/Projects/gemma3.c/gemma-3-4b-it  |  context: 4096
+load: 16.26 s
+
+test                             tokens/s     ms/token
+---------------------------- ------------ ------------
+prefill pp64                         9.31       107.44
+prefill pp256                        9.57       104.55
+prefill pp1024                       8.71       114.81
+decode tg128                         9.49       105.32
+decode tg128 @ depth 2048            7.32       136.62
+generate (sampled) tg128             5.77       173.21   (incl. 64-token prefill)
+tokenizer (bytes/s)                   187            -   (4064 bytes -> 721 tokens in 21678.3 ms)
+
+peak RSS: 8708 MB
+=== new-cpu 23:21:26
+
+this branch, make  |  model: /Users/robitec/Desktop/Projects/gemma3.c/gemma-3-4b-it  |  context: 4096
+load: 5.61 s
+
+test                             tokens/s     ms/token
+---------------------------- ------------ ------------
+prefill pp64                        66.01        15.15
+prefill pp256                       39.93        25.05
+prefill pp1024                      37.01        27.02
+decode tg128                         6.61       151.27
+decode tg128 @ depth 2048            7.44       134.40
+generate (sampled) tg128             6.28       159.26   (incl. 64-token prefill)
+tokenizer (bytes/s)               2203905            -   (4064 bytes -> 722 tokens in 1.8 ms)
+
+peak RSS: 8588 MB
+=== base-cpu 23:26:28
+
+original, make threads  |  model: /Users/robitec/Desktop/Projects/gemma3.c/gemma-3-4b-it  |  context: 4096
+load: 0.14 s
+
+test                             tokens/s     ms/token
+---------------------------- ------------ ------------
+prefill pp64                        10.02        99.78
+prefill pp256                        9.11       109.74
+prefill pp1024                       7.80       128.27
+decode tg128                         7.93       126.05
+decode tg128 @ depth 2048            5.80       172.50
+generate (sampled) tg128             5.66       176.63   (incl. 64-token prefill)
+tokenizer (bytes/s)                   183            -   (4064 bytes -> 721 tokens in 22190.3 ms)
+
+peak RSS: 7738 MB
+=== new-blas 23:35:15
+
+this branch, make blas  |  model: /Users/robitec/Desktop/Projects/gemma3.c/gemma-3-4b-it  |  context: 4096
+load: 0.92 s
+
+test                             tokens/s     ms/token
+---------------------------- ------------ ------------
+prefill pp64                        86.84        11.52
+prefill pp256                      154.32         6.48
+prefill pp1024                     148.33         6.74
+decode tg128                         8.19       122.05
+generate (sampled) tg128             7.41       134.89   (incl. 64-token prefill)
+
+peak RSS: 8667 MB
+=== done 23:36:28

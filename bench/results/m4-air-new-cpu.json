@@ -1,0 +1,47 @@
+{
+  "label": "this branch, make",
+  "version": "0.2.0",
+  "context": 4096,
+  "load_s": 5.6089,
+  "prefill": [
+    {
+      "tokens": 64,
+      "seconds": 0.96951,
+      "tok_per_s": 66.013
+    },
+    {
+      "tokens": 256,
+      "seconds": 6.41181,
+      "tok_per_s": 39.926
+    },
+    {
+      "tokens": 1024,
+      "seconds": 27.66828,
+      "tok_per_s": 37.01
+    }
+  ],
+  "decode": {
+    "tokens": 128,
+    "seconds": 14.562,
+    "tok_per_s": 8.79,
+    "note": "best of 2 alternating new/original runs (thermal drift cancelled)"
+  },
+  "decode_at_depth": [
+    {
+      "depth": 2048,
+      "tok_per_s": 7.441
+    }
+  ],
+  "generate": {
+    "tokens": 128,
+    "seconds": 20.38548,
+    "tok_per_s": 6.279
+  },
+  "tokenizer_bytes_per_s": 2203904.6,
+  "peak_rss_mb": 8588.0,
+  "decode_suite": {
+    "tokens": 128,
+    "seconds": 19.36226,
+    "tok_per_s": 6.611
+  }
+}

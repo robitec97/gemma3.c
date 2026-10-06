@@ -1,0 +1,12 @@
+{
+  "label": "this branch, make mps",
+  "version": "0.2.0",
+  "context": 4096,
+  "load_s": 4.3885,
+  "prefill": [{"tokens": 64, "seconds": 0.20950, "tok_per_s": 305.495}, {"tokens": 256, "seconds": 0.89160, "tok_per_s": 287.125}, {"tokens": 1024, "seconds": 3.71129, "tok_per_s": 275.915}],
+  "decode": {"tokens": 128, "seconds": 9.98765, "tok_per_s": 12.816},
+  "decode_at_depth": [{"depth": 2048, "tok_per_s": 11.549}],
+  "generate": {"tokens": 128, "seconds": 14.44067, "tok_per_s": 8.864},
+  "tokenizer_bytes_per_s": 1039918.1,
+  "peak_rss_mb": 8263.7
+}

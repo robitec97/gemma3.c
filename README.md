@@ -25,7 +25,7 @@ multi-threaded) or on Apple Silicon GPUs through a hand-written Metal backend.
   * BF16 SIMD kernels (NEON, AVX2+FMA) and batched prompt processing
   * a low-latency thread pool
   * a Metal GPU backend with zero-copy weights
-* **Memory-mapped BF16 weights.** The model loads in well under a second, with no conversion step.
+* **Memory-mapped BF16 weights.** No conversion step. Loading takes ~0.15 s when the files are in the page cache, and the Metal backend uses them zero-copy.
 * **Multi-turn chat that reuses the KV cache.** Each turn only processes the new tokens.
 * **CLI and library API:** streaming callbacks and timing statistics (TTFT, prefill and decode tokens/s).
 * **Tested:**
@@ -42,31 +42,52 @@ multi-threaded) or on Apple Silicon GPUs through a hand-written Metal backend.
   </picture>
 </p>
 
-Gemma 3 4B IT, BF16 weights, MacBook Air **M4** (4P+6E CPU cores, 10-core GPU, 16 GB):
+Gemma 3 4B IT, BF16 weights, MacBook Air **M4** (4P+6E CPU cores, 10-core GPU,
+16 GB). Every row was measured in one session with the same harness
+(`bench/bench_e2e.c`, public API only), run back to back against the original
+code:
 
-| Build | Prompt processing (pp256) | Generation (tg128) | Time to first token (256-token prompt) | Load |
-|-------|--------------------------:|-------------------:|-------------------------:|-----:|
-| `make` (CPU, NEON, 10 threads) | TBD | TBD | TBD | TBD |
-| `make mps` (Metal GPU) | TBD | TBD | TBD | TBD |
-| *original, `make threads`* | *12.2 tok/s* | *11.3 tok/s* | *21 s* | *0.1 s* |
-| *original, `make mps`* | *15.2 tok/s* | *12.9 tok/s* | *17 s* | *2.9 s* |
-| *original, `make` (default)* | *0.6 tok/s* | *0.5 tok/s* | *7 min* | *0.1 s* |
+| Build | Prompt processing (256 tokens) | Generation | Generation at 2K context |
+|-------|-------------------------------:|-----------:|-------------------------:|
+| **`make mps`** (Metal GPU) | **287 tok/s** | **12.8 tok/s** | **11.5 tok/s** |
+| *original `make mps`* | *9.6 tok/s* | *9.5 tok/s* | *7.3 tok/s* |
+| **`make blas`** (CPU + Accelerate) | **154 tok/s** | 8.2 tok/s | |
+| **`make`** (CPU, NEON, 10 threads) | **39.9 tok/s** | **8.8 tok/s** | **7.4 tok/s** |
+| *original `make threads`* | *9.1 tok/s* | *8.3 tok/s* | *5.8 tok/s* |
+| *original `make` (the old default)* | *0.6 tok/s* | *0.5 tok/s* | |
+
+* **Prompt processing** is 30× faster on the GPU and 4–17× faster on the CPU.
+  Prompts now run as batched matrix-matrix products instead of one token at a
+  time. A 1,000-token document is read in under 4 s on the GPU (it used to
+  take nearly 2 minutes).
+* **Generation** is limited by memory bandwidth: every token streams 7.8 GB
+  of weights, and the M4's ~120 GB/s caps decoding at about 15 tok/s. The
+  Metal backend now gets about 105 GB/s. The original threaded CPU build was
+  already close to the limit, so CPU generation is only ~5% faster. The
+  default `make` build used to be scalar and single-threaded; it is now about
+  17× faster.
+* **Long contexts:** attention runs in parallel on both backends, so
+  generation stays fast as the context grows.
+* **Loading:** Metal no longer copies the weights (the original used ~8 GB of
+  extra RAM). Loading is just `mmap`: about 0.15 s when the files are in the OS
+  page cache, otherwise limited by SSD speed for 8.6 GB.
+
+The fanless Air throttles under sustained load, so absolute numbers drift by up
+to ~25% between runs. CPU generation figures come from alternating runs of both
+builds; see [bench/results](bench/results/README.md) for the raw data.
 
 Other measured improvements:
 
 | | Original | Now |
 |---|---:|---:|
-| Tokenizer throughput | 389 bytes/s (4 KB prompt: 10.4 s) | 3.4 MB/s (4 KB prompt: 1.2 ms) |
+| Tokenizer, 4 KB prompt | 10.4–22 s (O(n²) BPE) | 1–4 ms |
 | Sampling cost per token (top-k 50, top-p 0.9) | 9.2 ms | 0.08 ms |
 | Second chat turn | re-processes the whole conversation | only the new tokens (KV cache reuse) |
 | Extra RAM for Metal weights | ~8 GB copy | 0 (zero-copy) |
 
-Generation is memory-bandwidth bound. Every token streams all 7.8 GB of
-weights, so the M4's ~120 GB/s caps decoding at roughly 15 tok/s. Prompt
-processing is compute bound and gains the most from batching.
-
-**Reproduce:** `make bench && ./gemma3-bench -p 64,256,1024 -n 128`. For every
-backend, run `scripts/bench.sh`. See [Benchmarks](#testing-and-benchmarks).
+**Reproduce:** `make bench && ./gemma3-bench -p 64,256,1024 -n 128 -d 2048`.
+For every backend, run `scripts/bench.sh`. See
+[Testing and benchmarks](#testing-and-benchmarks).
 
 ## Quick start
 

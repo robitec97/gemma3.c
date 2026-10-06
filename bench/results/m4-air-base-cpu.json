@@ -1,0 +1,47 @@
+{
+  "label": "original, make threads",
+  "version": "0.1.0",
+  "context": 4096,
+  "load_s": 0.1372,
+  "prefill": [
+    {
+      "tokens": 64,
+      "seconds": 6.38566,
+      "tok_per_s": 10.022
+    },
+    {
+      "tokens": 256,
+      "seconds": 28.09289,
+      "tok_per_s": 9.113
+    },
+    {
+      "tokens": 1024,
+      "seconds": 131.3489,
+      "tok_per_s": 7.796
+    }
+  ],
+  "decode": {
+    "tokens": 128,
+    "seconds": 15.36615,
+    "tok_per_s": 8.33,
+    "note": "best of 2 alternating new/original runs (thermal drift cancelled)"
+  },
+  "decode_at_depth": [
+    {
+      "depth": 2048,
+      "tok_per_s": 5.797
+    }
+  ],
+  "generate": {
+    "tokens": 128,
+    "seconds": 22.60818,
+    "tok_per_s": 5.662
+  },
+  "tokenizer_bytes_per_s": 183.1,
+  "peak_rss_mb": 7738.3,
+  "decode_suite": {
+    "tokens": 128,
+    "seconds": 16.13456,
+    "tok_per_s": 7.933
+  }
+}
