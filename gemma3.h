@@ -231,7 +231,9 @@ gemma3_tokenizer *gemma3_get_tokenizer(gemma3_ctx *ctx);
  * ========================================================================== */
 
 /**
- * Encode text to token IDs
+ * Encode text to token IDs (matches the Hugging Face Gemma 3 tokenizer)
+ * Special and added tokens written in the text (e.g. "<start_of_turn>") are
+ * recognized as single tokens.
  * @param tok       Tokenizer from gemma3_get_tokenizer()
  * @param text      Input text (UTF-8)
  * @param tokens    Output array for token IDs
@@ -245,20 +247,34 @@ int gemma3_tokenize(gemma3_tokenizer *tok, const char *text,
 
 /**
  * Decode token IDs to text
+ * Special tokens (<bos>, <eos>, <pad>, <unk>, <start_of_turn>, <end_of_turn>,
+ * image markers) produce no text; byte tokens <0xNN> become raw bytes.
  * @param tok       Tokenizer from gemma3_get_tokenizer()
- * @param tokens    Array of token IDs
- * @param num_tokens Number of tokens
+ * @param tokens    Array of token IDs (may be NULL if num_tokens == 0)
+ * @param num_tokens Number of tokens (0 yields an empty string)
  * @return Decoded string (caller must free), or NULL on error
  */
 char *gemma3_detokenize(gemma3_tokenizer *tok, const int *tokens, int num_tokens);
 
 /**
- * Decode a single token ID to text
+ * Get the raw vocabulary piece for a token ID (e.g. "▁world", "<0x0A>")
  * @param tok       Tokenizer
- * @param token_id  Token ID to decode
- * @return Token string (pointer to internal storage, do not free), or NULL
+ * @param token_id  Token ID to look up
+ * @return Piece string (pointer to internal storage, do not free), or NULL
  */
 const char *gemma3_decode_token(gemma3_tokenizer *tok, int token_id);
+
+/**
+ * Decode a single token to the bytes it contributes to the output text,
+ * for streaming. "▁" becomes a space, <0xNN> becomes the raw byte (which may
+ * be part of a multi-byte UTF-8 character), special tokens produce nothing.
+ * @param tok       Tokenizer
+ * @param token_id  Token ID to decode
+ * @param out       Output buffer (NUL-terminated if there is room)
+ * @param out_size  Size of out in bytes (256 is always enough)
+ * @return Number of bytes written (0 for special tokens), or negative error code
+ */
+int gemma3_token_to_bytes(gemma3_tokenizer *tok, int token_id, char *out, int out_size);
 
 /**
  * Get special token IDs
