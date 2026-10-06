@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #ifdef __APPLE__
@@ -80,7 +81,11 @@ static void *worker_func(void *param) {
         while ((gen = atomic_load(&pool->generation)) == seen) {
             if (atomic_load_explicit(&pool->shutdown, memory_order_relaxed)) return NULL;
             cpu_relax();
-            if ((++spins & 1023) != 0 || now_ns() - spin_start < SPIN_NS) continue;
+            if ((++spins & 1023) != 0) continue;
+            /* Let other runnable threads (e.g. a descheduled worker on an
+             * oversubscribed machine) make progress while we wait. */
+            sched_yield();
+            if (now_ns() - spin_start < SPIN_NS) continue;
 
             /* Idle: sleep until the next job. The seq_cst increment of
              * `sleeping` followed by the generation re-check pairs with the
@@ -205,8 +210,10 @@ void gemma3_thread_pool_run(gemma3_thread_pool *pool, gemma3_task_fn fn, void *a
 
     fn(arg, 0, pool->num_threads);
 
+    int spins = 0;
     while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
         cpu_relax();
+        if ((++spins & 255) == 0) sched_yield();  /* a worker may be descheduled */
     }
 }
 

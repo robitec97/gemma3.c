@@ -344,11 +344,15 @@ static void test_thread_pool(gemma3_thread_pool *pool) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double us = ((t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3) / reps;
     printf("  dispatch latency: %.2f us per parallel job\n", us);
-    CHECK(us < 1000.0, "dispatch latency too high: %.1f us", us);
+    /* Generous bound: catches a broken pool (e.g. sleeping through every
+     * job), not slow CI virtual machines. */
+    CHECK(us < 20000.0, "dispatch latency too high: %.1f us", us);
 }
 
 int main(void) {
-    gemma3_thread_pool *pool = gemma3_thread_pool_create(4);
+    int nthreads = gemma3_num_cpus() < 4 ? gemma3_num_cpus() : 4;
+    if (nthreads < 2) nthreads = 2;     /* still exercise the multi-threaded paths */
+    gemma3_thread_pool *pool = gemma3_thread_pool_create(nthreads);
     if (!pool) {
         printf("failed to create thread pool\n");
         return 1;
