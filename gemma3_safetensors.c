@@ -382,6 +382,10 @@ static int st_open_file(st_file *f, const char *path) {
     }
     f->header_size = header_size;
 
+    /* Start reading the weights in the background so the first forward pass
+     * doesn't stall on page faults (the advice is only a hint). */
+    madvise(f->mmap_ptr, f->file_size, MADV_WILLNEED);
+
     // Data starts after 8-byte length + header
     f->data_start = (char *)f->mmap_ptr + 8 + f->header_size;
 

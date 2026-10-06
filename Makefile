@@ -155,7 +155,7 @@ test test-kernels:
 test-model:
 	@$(MAKE) --no-print-directory build_core
 	@$(MAKE) --no-print-directory gemma3-test-tokenizer
-	./gemma3-test-tokenizer $(MODEL)/tokenizer.model tests/tokenizer_golden.tsv
+	./gemma3-test-tokenizer $(MODEL)/tokenizer.model tests
 	./tests/test_e2e.sh ./$(TARGET) $(MODEL)
 
 gemma3-test-tokenizer: tests/test_tokenizer.c $(OBJS_LIB)

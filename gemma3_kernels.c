@@ -533,9 +533,12 @@ void gemma3_embed_bf16(float *output, const uint16_t *embed, int token_id, int h
 /* gelu_tanh(x) = 0.5 x (1 + tanh(u)) = x / (1 + exp(-2u)),
  * u = sqrt(2/pi) (x + 0.044715 x^3) */
 static inline float gelu_scalar(float x) {
+    /* Written as x * sigmoid(2u): unlike 0.5x(1 + tanh(u)) it does not lose
+     * all precision to cancellation for negative x */
     const float sqrt_2_over_pi = 0.7978845608028654f;
-    float u = sqrt_2_over_pi * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + tanhf(u));
+    float t = -2.0f * sqrt_2_over_pi * (x + 0.044715f * x * x * x);
+    if (t > 88.0f) t = 88.0f;
+    return x / (1.0f + expf(t));
 }
 
 void gemma3_gelu_tanh_mul(float *gate, const float *up, int n) {

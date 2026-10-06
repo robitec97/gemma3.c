@@ -353,7 +353,11 @@ char *gemma3_chat(gemma3_ctx *ctx, const gemma3_message *messages, int num_msgs,
                   gemma3_token_callback callback, void *user_data);
 
 /**
- * Format messages with Gemma 3 chat template
+ * Format messages with the Gemma 3 chat template
+ *
+ * The result starts with "<bos>" (which the tokenizer maps to the BOS token),
+ * so tokenize it with add_bos=0. A system message is folded into the first
+ * user turn, as in the official template.
  * @param tok       Tokenizer
  * @param messages  Array of chat messages
  * @param num_msgs  Number of messages
