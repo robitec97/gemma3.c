@@ -91,7 +91,7 @@ OBJ_MAIN = $(BUILD_DIR)/$(MODE)/main.o
 
 # --- Convenience Targets ---
 
-.PHONY: all native portable debug asan blas mps fast threads blas-threads mps-threads \
+.PHONY: all native portable debug asan blas mps \
         build_core test test-kernels test-model bench bench-kernels example clean help
 
 all: native
@@ -113,11 +113,6 @@ blas:
 
 mps:
 	@$(MAKE) --no-print-directory build_core MODE=mps CC=clang
-
-# Older target names (threads are now always enabled)
-fast threads: native
-blas-threads: blas
-mps-threads: mps
 
 build_core: $(TARGET)
 

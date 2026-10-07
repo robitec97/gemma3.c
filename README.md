@@ -14,18 +14,18 @@ multi-threaded) or on Apple Silicon GPUs through a hand-written Metal backend.
 
 ## Highlights
 
-* **Pure C11, zero dependencies.** Metal and Accelerate are optional, macOS only.
+* **Pure C11, zero dependencies.** Metal (GPU) and Accelerate (BLAS) are optional extras on macOS.
 * **Faithful Gemma 3:**
   * grouped-query attention with 5:1 local/global sliding-window layers
   * QK-norm and linear RoPE scaling
-  * logits match an independent reference implementation to **1e-4**
+  * logits match an independent NumPy reference implementation to within **1e-4**
 * **Exact tokenizer:** SentencePiece BPE with special tokens, verified token-for-token
   against Hugging Face `tokenizers`. It runs at 3-11 MB/s.
 * **Fast:**
   * BF16 SIMD kernels (NEON, AVX2+FMA) and batched prompt processing
   * a low-latency thread pool
-  * a Metal GPU backend with zero-copy weights
-* **Memory-mapped BF16 weights.** No conversion step. Loading takes ~0.15 s when the files are in the page cache, and the Metal backend uses them zero-copy.
+  * a Metal GPU backend that uses the weights in place, without copying them
+* **Runs the official weights directly.** The BF16 safetensors files from Hugging Face are memory-mapped as they are, with no conversion step. Loading takes ~0.15 s when the files are already in the OS file cache.
 * **Multi-turn chat that reuses the KV cache.** Each turn only processes the new tokens.
 * **CLI and library API:** streaming callbacks and timing statistics (TTFT, prefill and decode tokens/s).
 * **Tested:**
@@ -33,94 +33,108 @@ multi-threaded) or on Apple Silicon GPUs through a hand-written Metal backend.
   * end-to-end checks and a reference-logit comparison
   * CI on Linux x86-64/arm64 and macOS, with ASan/UBSan
 
-## Performance
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/speedup-dark.svg">
-    <img alt="Prompt processing and generation speed, original vs. current" src="docs/images/speedup-light.svg" width="820">
-  </picture>
-</p>
-
-Gemma 3 4B IT, BF16 weights, MacBook Air **M4** (4P+6E CPU cores, 10-core GPU,
-16 GB). Every row was measured in one session with the same harness
-(`bench/bench_e2e.c`, public API only), run back to back against the original
-code:
-
-| Build | Prompt processing (256 tokens) | Generation | Generation at 2K context |
-|-------|-------------------------------:|-----------:|-------------------------:|
-| **`make mps`** (Metal GPU) | **287 tok/s** | **12.8 tok/s** | **11.5 tok/s** |
-| *original `make mps`* | *9.6 tok/s* | *9.5 tok/s* | *7.3 tok/s* |
-| **`make blas`** (CPU + Accelerate) | **154 tok/s** | 8.2 tok/s | |
-| **`make`** (CPU, NEON, 10 threads) | **39.9 tok/s** | **8.8 tok/s** | **7.4 tok/s** |
-| *original `make threads`* | *9.1 tok/s* | *8.3 tok/s* | *5.8 tok/s* |
-| *original `make` (the old default)* | *0.6 tok/s* | *0.5 tok/s* | |
-
-* **Prompt processing** is 30× faster on the GPU and 4–17× faster on the CPU.
-  Prompts now run as batched matrix-matrix products instead of one token at a
-  time. A 1,000-token document is read in under 4 s on the GPU (it used to
-  take nearly 2 minutes).
-* **Generation** is limited by memory bandwidth: every token streams 7.8 GB
-  of weights, and the M4's ~120 GB/s caps decoding at about 15 tok/s. The
-  Metal backend now gets about 105 GB/s. The original threaded CPU build was
-  already close to the limit, so CPU generation is only ~5% faster. The
-  default `make` build used to be scalar and single-threaded; it is now about
-  17× faster.
-* **Long contexts:** attention runs in parallel on both backends, so
-  generation stays fast as the context grows.
-* **Loading:** Metal no longer copies the weights (the original used ~8 GB of
-  extra RAM). Loading is just `mmap`: about 0.15 s when the files are in the OS
-  page cache, otherwise limited by SSD speed for 8.6 GB.
-
-The fanless Air throttles under sustained load, so absolute numbers drift by up
-to ~25% between runs. CPU generation figures come from alternating runs of both
-builds; see [bench/results](bench/results/README.md) for the raw data.
-
-Other measured improvements:
-
-| | Original | Now |
-|---|---:|---:|
-| Tokenizer, 4 KB prompt | 10.4–22 s (O(n²) BPE) | 1–4 ms |
-| Sampling cost per token (top-k 50, top-p 0.9) | 9.2 ms | 0.08 ms |
-| Second chat turn | re-processes the whole conversation | only the new tokens (KV cache reuse) |
-| Extra RAM for Metal weights | ~8 GB copy | 0 (zero-copy) |
-
-**Reproduce:** `make bench && ./gemma3-bench -p 64,256,1024 -n 128 -d 2048`.
-For every backend, run `scripts/bench.sh`. See
-[Testing and benchmarks](#testing-and-benchmarks).
-
 ## Quick start
+
+You need a C compiler and `make` (on macOS, run `xcode-select --install`),
+Python 3 for the one-time model download, about 9 GB of free disk space, and
+ideally 16 GB of RAM.
 
 ### 1. Download the model
 
-The official weights are gated. Accept the license at
-[huggingface.co/google/gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it),
-create a [token](https://huggingface.co/settings/tokens), then:
+gemma3.c runs Google's official Gemma 3 4B IT checkpoint from Hugging Face.
+Google asks everyone to accept the Gemma license before downloading it, so you
+need a free Hugging Face account:
 
-```bash
-pip install huggingface_hub
-HF_TOKEN=hf_... python download_model.py      # ~8.6 GB into ./gemma-3-4b-it
-```
+1. Sign in to Hugging Face, open the
+   [google/gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it) model page
+   and accept the license.
+2. Create an access token at
+   [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+   A **Read** token is enough. It starts with `hf_`.
+3. Install the Hugging Face client and run the download script with your token:
+
+   ```bash
+   python3 -m pip install huggingface_hub
+   HF_TOKEN=hf_your_token python3 download_model.py
+   ```
+
+The script downloads only the files gemma3.c needs (the weights, `config.json`
+and `tokenizer.model`, about 8.6 GB) into `./gemma-3-4b-it`. That is the
+directory `./gemma3` looks in by default.
+
+* **"Access denied"** means the license has not been accepted for the account
+  that created the token. Accept it on the model page and run the script again.
+* **pip refuses to install** (an "externally-managed-environment" error from a
+  Homebrew or system Python): create a virtual environment first with
+  `python3 -m venv .venv && . .venv/bin/activate`, then repeat step 3.
+* **To store the model elsewhere,** run the script with
+  `--output-dir /path/to/model`. Then run `./gemma3 -m /path/to/model ...`, or
+  set `GEMMA3_MODEL=/path/to/model` once.
 
 ### 2. Build
 
 ```bash
-make            # CPU: native SIMD (NEON / AVX2) + all cores   - Linux, macOS, WSL
-make mps        # Apple Silicon GPU (Metal), with CPU fallback  - recommended on Macs
+make        # CPU build for Linux, macOS and WSL (uses NEON or AVX2 and all cores)
+make mps    # GPU build for Apple Silicon Macs (Metal); recommended on Macs
 ```
+
+Both produce a single binary, `./gemma3`. [Build targets](#build-targets) lists
+the other options.
 
 ### 3. Run
 
 ```bash
-./gemma3 -p "Explain quantum computing simply."     # one-shot prompt
+./gemma3 -p "Explain quantum computing simply."     # answer one prompt
 ./gemma3 -i                                          # interactive chat
+./gemma3 -p "Write a haiku about pointers" --stats  # also print speed statistics
+
+# Pipe in a file as the prompt; -s sets the system prompt
 cat notes.md | ./gemma3 -s "Summarize the user's text in 3 bullets."
-./gemma3 -p "Write a haiku about pointers" --stats  # with timing statistics
 ```
 
 <p align="center">
   <img alt="One-shot prompt with --stats" src="docs/images/single-prompt.svg" width="820">
 </p>
+
+## Performance
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/performance-dark.svg">
+    <img alt="Prompt processing and generation speed for each build" src="docs/images/performance-light.svg" width="820">
+  </picture>
+</p>
+
+Gemma 3 4B IT with BF16 weights on a MacBook Air **M4** (4 performance + 6
+efficiency CPU cores, 10-core GPU, 16 GB), measured with `bench/bench_e2e.c`:
+
+| Build | Prompt processing (256 tokens) | Generation | Generation at 2K context |
+|-------|-------------------------------:|-----------:|-------------------------:|
+| `make mps` (Metal GPU) | 287 tok/s | 12.8 tok/s | 11.5 tok/s |
+| `make blas` (CPU + Accelerate) | 154 tok/s | 8.2 tok/s | |
+| `make` (CPU, NEON, 10 threads) | 39.9 tok/s | 8.8 tok/s | 7.4 tok/s |
+
+* **Prompt processing** is how fast the model reads your input. Tokens go
+  through the network in batches of up to 128, as matrix-matrix products, so
+  each weight is read once per batch instead of once per token. On the GPU, a
+  1,000-token document is read in under 4 s.
+* **Generation** is how fast the reply is written, one token at a time. It is
+  limited by memory bandwidth: every token reads 7.8 GB of weights, and the
+  M4's ~120 GB/s caps generation at about 15 tok/s. The Metal backend reaches
+  about 105 GB/s.
+* **Long contexts:** attention runs in parallel on both backends, so generation
+  stays fast as the conversation grows.
+* **Loading** is a memory map of the weight files: about 0.15 s when they are
+  already in the OS file cache, otherwise as long as the SSD takes to read
+  8.6 GB.
+
+The fanless Air throttles under sustained load, so numbers vary by up to ~25%
+between runs. CPU generation is the best of two short runs. The raw data is in
+[bench/results](bench/results/README.md).
+
+**Reproduce:** `make bench && ./gemma3-bench -p 64,256,1024 -n 128 -d 2048`,
+or `scripts/bench.sh` to build and benchmark every backend. See
+[Testing and benchmarks](#testing-and-benchmarks).
 
 ## Build targets
 
@@ -128,7 +142,7 @@ cat notes.md | ./gemma3 -s "Summarize the user's text in 3 bullets."
 |--------|-------------|
 | `make` | Optimized CPU build: `-O3`, native SIMD (NEON / AVX2+FMA) and a thread pool. **Default.** |
 | `make mps` | Metal GPU backend for Apple Silicon (falls back to the CPU if Metal is unavailable) |
-| `make blas` | CPU build that uses BLAS `sgemm` for prompt processing (Accelerate on macOS, OpenBLAS elsewhere) |
+| `make blas` | CPU build that uses BLAS `sgemm` for prompt processing (Accelerate on macOS; OpenBLAS on Linux, e.g. `apt install libopenblas-dev`) |
 | `make portable` | CPU build without `-march/-mcpu=native`, for binaries you ship to other machines |
 | `make debug` / `make asan` | Debug build / AddressSanitizer + UBSan build |
 | `make test` | Kernel, sampler and thread-pool unit tests (no model needed) |
@@ -136,9 +150,8 @@ cat notes.md | ./gemma3 -s "Summarize the user's text in 3 bullets."
 | `make bench` / `make bench-kernels` | End-to-end benchmark / kernel micro-benchmarks |
 | `make example` | Build the library example in `examples/simple.c` |
 
-The old target names (`threads`, `fast`, `blas-threads`, `mps-threads`) still
-work. Threads are now always enabled. Set `EXTRA_CFLAGS=-DGEMMA3_NO_SIMD` to
-build the plain C kernels only.
+Set `EXTRA_CFLAGS=-DGEMMA3_NO_SIMD` to build with the plain C kernels only
+(no NEON or AVX2).
 
 ## Command line
 
@@ -237,13 +250,16 @@ gemma3_free(ctx);
   low-level access.
 
 [`examples/simple.c`](examples/simple.c) is a complete two-turn example
-(`make example`). See [`gemma3.h`](gemma3.h) for the full API.
+(`make example`). See [`gemma3.h`](gemma3.h) for the full API. To use the
+library in your own program, compile the `gemma3*.c` files together with your
+code, the same way the `example` target in the [`Makefile`](Makefile) does.
 
 ## Testing and benchmarks
 
 ```bash
 make test               # SIMD kernels vs double-precision references, sampler, thread pool
 make test-model         # tokenizer golden tests (vs HF tokenizers), KV-cache reuse, end-to-end
+                        # (uses ./gemma-3-4b-it; set MODEL=/path/to/model for another directory)
 make bench-kernels      # matvec GB/s, GEMM GFLOP/s, dispatch latency, sampler cost (no model)
 make bench && ./gemma3-bench -p 64,256,1024 -n 128 --json out.json
 scripts/bench.sh        # build every backend and benchmark it -> bench/results/*.json
@@ -284,6 +300,7 @@ global RoPE. Kernel micro-benchmarks on the M4:
 | `gemma3_metal.m` | Metal backend: embedded MSL kernels, zero-copy weights, batched GPU prefill |
 | `gemma3_tokenizer.c` | SentencePiece BPE (heap-based), special tokens, chat template |
 | `gemma3_safetensors.c` | mmap'd SafeTensors loader with header and shape validation |
+| `main.c` | The `gemma3` command-line program |
 
 * **Prefill and decode share one path.** Tokens go through the network in
   chunks of up to 128. Every projection is a BF16 GEMM, so each weight is
@@ -326,12 +343,6 @@ On a 16 GB machine, close memory-hungry apps for the best generation speed.
 * Text only (the vision tower is not implemented)
 * BF16 weights only (no quantization yet)
 * Gemma 3 4B shapes are compile-time constants
-
-## Review notes
-
-[`docs/REVIEW.md`](docs/REVIEW.md) lists the issues found in a full code review
-(tokenizer, chat template, RoPE scaling, sampling, robustness, performance) and
-how each was fixed.
 
 ## License
 

@@ -1,5 +1,5 @@
 {
-  "label": "this branch, make blas",
+  "label": "make blas",
   "version": "0.2.0",
   "context": 4096,
   "load_s": 0.9232,

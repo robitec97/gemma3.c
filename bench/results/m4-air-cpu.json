@@ -1,5 +1,5 @@
 {
-  "label": "this branch, make",
+  "label": "make",
   "version": "0.2.0",
   "context": 4096,
   "load_s": 5.6089,
@@ -24,7 +24,7 @@
     "tokens": 128,
     "seconds": 14.562,
     "tok_per_s": 8.79,
-    "note": "best of 2 alternating new/original runs (thermal drift cancelled)"
+    "note": "best of 2 short runs (limits thermal drift)"
   },
   "decode_at_depth": [
     {
